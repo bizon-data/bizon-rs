@@ -512,14 +512,14 @@ mod tests {
     #[test]
     fn templates_select_themselves_after_substitution() {
         let deb = DEBEZIUM_TEMPLATE
-            .replace("${cluster-name}", "us-east1-635c")
+            .replace("${cluster-name}", "other-cluster")
             .replace("${topic-column-to-remove}", "{'t': ['c']}");
         let indented: String = deb.lines().map(|l| format!("    {l}\n")).collect();
         let b = Builtin::select("debezium", &indented).unwrap();
         assert_eq!(
             b,
             Builtin::Debezium {
-                cluster: "us-east1-635c".into(),
+                cluster: "other-cluster".into(),
                 deny_list: [("t".to_string(), vec!["c".to_string()])].into(),
             }
         );
