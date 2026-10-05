@@ -84,6 +84,14 @@ pub enum BuiltinConfig {
     },
     /// CloudEvents over JSON: `payload` is the message value; `ce_type`/`ce_id`/`ce_time` from headers.
     Cloudevents { cluster: String },
+    /// As `cloudevents`, plus all headers in `headers`; the `ce_*` headers are optional.
+    CloudeventsEnriched { cluster: String },
+    /// JSON value as `payload`, with kafka coordinates and timestamps.
+    JsonEvents { cluster: String },
+    /// JSON change event: `payload` is `after`, `__before` is `before`, plus `ce_type`/`ce_id` headers.
+    JsonCdc { cluster: String },
+    /// Avro value as `payload`; `__schema` keeps the top-level fields, with record fields inlined.
+    AvroEvents { cluster: String },
 }
 
 impl From<BuiltinConfig> for Builtin {
@@ -97,6 +105,10 @@ impl From<BuiltinConfig> for Builtin {
                 deny_list: columns_to_remove,
             },
             BuiltinConfig::Cloudevents { cluster } => Builtin::CloudEvents { cluster },
+            BuiltinConfig::CloudeventsEnriched { cluster } => Builtin::CloudEventsEnriched { cluster },
+            BuiltinConfig::JsonEvents { cluster } => Builtin::JsonEvents { cluster },
+            BuiltinConfig::JsonCdc { cluster } => Builtin::JsonCdc { cluster },
+            BuiltinConfig::AvroEvents { cluster } => Builtin::AvroEvents { cluster },
         }
     }
 }
@@ -481,8 +493,31 @@ mod tests {
     #[test]
     fn builtin_transform_matches_the_template_it_replaces() {
         assert_eq!(load("avro-cdc-builtin").unwrap().transform, load("avro-cdc").unwrap().transform);
-        let ce = with_transform("- label: events\n  builtin: {name: cloudevents, cluster: c1}").unwrap();
-        assert_eq!(ce.transform, Builtin::CloudEvents { cluster: "c1".into() });
+        for (name, want) in [
+            ("cloudevents", Builtin::CloudEvents { cluster: "c1".into() }),
+            ("cloudevents_enriched", Builtin::CloudEventsEnriched { cluster: "c1".into() }),
+            ("json_events", Builtin::JsonEvents { cluster: "c1".into() }),
+            ("json_cdc", Builtin::JsonCdc { cluster: "c1".into() }),
+            ("avro_events", Builtin::AvroEvents { cluster: "c1".into() }),
+        ] {
+            let c = with_transform(&format!("- label: x\n  builtin: {{name: {name}, cluster: c1}}")).unwrap();
+            assert_eq!(c.transform, want);
+        }
+    }
+
+    #[test]
+    fn selects_each_inline_template_by_code_not_label() {
+        let cluster = || "my-cluster".to_string();
+        // Three of these label their transform `parse_events`.
+        for (name, want) in [
+            ("cloudevents", Builtin::CloudEvents { cluster: cluster() }),
+            ("cloudevents-enriched", Builtin::CloudEventsEnriched { cluster: cluster() }),
+            ("json-events", Builtin::JsonEvents { cluster: cluster() }),
+            ("json-cdc", Builtin::JsonCdc { cluster: cluster() }),
+            ("avro-events", Builtin::AvroEvents { cluster: cluster() }),
+        ] {
+            assert_eq!(load(name).unwrap().transform, want, "{name}");
+        }
     }
 
     #[test]
