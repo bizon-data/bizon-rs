@@ -11,8 +11,9 @@ use base64::Engine;
 use bizon_stream::config::Config;
 use bizon_stream::kafka::message::{MessageParser, RawMessage};
 use bizon_stream::kafka::registry::{Registry, RegistrySchema};
-use bizon_stream::pipeline::{Outcome, Pipeline};
+use bizon_stream::pipeline::{Outcome, Pipeline, PipelineError};
 use bizon_stream::proto::descriptor::TableDescriptor;
+use bizon_stream::transform::TransformError;
 use serde_json::Value;
 
 const FROZEN_AT: &str = "2026-01-01T00:00:00.123456";
@@ -49,6 +50,26 @@ fn synthetic_debezium() {
 #[test]
 fn synthetic_cloudevents() {
     synthetic("cloudevents");
+}
+
+#[test]
+fn synthetic_cloudevents_enriched() {
+    synthetic("cloudevents_enriched");
+}
+
+#[test]
+fn synthetic_json_events() {
+    synthetic("json_events");
+}
+
+#[test]
+fn synthetic_json_cdc() {
+    synthetic("json_cdc");
+}
+
+#[test]
+fn synthetic_avro_events() {
+    synthetic("avro_events");
 }
 
 #[test]
@@ -123,6 +144,8 @@ fn assert_parity(capture: &std::path::Path, config: &std::path::Path) {
             }
             // bizon's frame-building step (source_records_to_df) fails on values our decoder rejects.
             ("error", Err(e)) if g["stage"] == e.stage() || (g["stage"] == "frame" && e.stage() == "source") => Ok(()),
+            // json.loads accepts NaN/Infinity in string keys and bizon fails later, at encode; see docs/decisions.md.
+            ("error", Err(PipelineError::Transform(TransformError::KeysJson(_)))) if g["stage"] == "encode" => Ok(()),
             (want, got) => Err(format!(
                 "python {want} ({}) vs rust {:?}",
                 g["error"],

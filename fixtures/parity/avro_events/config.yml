@@ -1,0 +1,120 @@
+name: synth-avro-events
+source:
+  name: kafka
+  stream: topic
+  sync_mode: stream
+  force_ignore_checkpoint: false
+  topics:
+  - name: ae.a
+    destination_id: p.d.ae
+  batch_size: BIZON_ENV_BATCH_SIZE
+  consumer_timeout: BIZON_ENV_CONSUMER_TIMEOUT
+  bootstrap_servers: BIZON_ENV_BOOTSTRAP_SERVERS
+  group_id: my-consumer-group
+  consumer_config:
+    auto.offset.reset: earliest
+    enable.auto.commit: false
+    session.timeout.ms: 60000
+    security.protocol: SASL_SSL
+    partition.assignment.strategy: cooperative-sticky
+  authentication:
+    type: basic
+    schema_registry_url: BIZON_ENV_APICURIO_URL
+    schema_registry_username: BIZON_ENV_APICURIO_USER
+    schema_registry_password: BIZON_ENV_APICURIO_PASSWORD
+    params:
+      username: BIZON_ENV_KAFKA_USERNAME
+      password: BIZON_ENV_KAFKA_PASSWORD
+destination:
+  name: bigquery_streaming_v2
+  config:
+    dataset_id: BIZON_ENV_DATASET_ID
+    dataset_location: BIZON_ENV_DATASET_LOCATION
+    project_id: BIZON_ENV_PROJECT_ID
+    bq_max_rows_per_request: BIZON_ENV_BQ_MAX_ROWS_PER_REQUEST
+    max_concurrent_threads: BIZON_ENV_BQ_MAX_CONCURRENT_THREADS
+    unnest: true
+    time_partitioning:
+      type: DAY
+      field: __inserted_at
+    record_schemas:
+    - destination_id: p.d.ae
+      record_schema:
+      - name: account_id
+        type: INTEGER
+        mode: REQUIRED
+      - name: id
+        type: INTEGER
+        mode: REQUIRED
+      - name: payload
+        type: JSON
+        mode: NULLABLE
+      - name: __operation
+        type: STRING
+        mode: NULLABLE
+      - name: __deleted
+        type: BOOLEAN
+        mode: NULLABLE
+      - name: __cluster
+        type: STRING
+        mode: NULLABLE
+      - name: __kafka_partition
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_offset
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_topic
+        type: STRING
+        mode: NULLABLE
+      - name: __schema
+        type: JSON
+        mode: NULLABLE
+      - name: __event_timestamp
+        type: TIMESTAMP
+        mode: NULLABLE
+      - name: __inserted_at
+        type: TIMESTAMP
+        mode: NULLABLE
+        default_value_expression: CURRENT_TIMESTAMP()
+      clustering_keys:
+      - account_id
+      - id
+transforms:
+- label: parse_avro_events
+  python: |
+    from datetime import datetime
+
+    keys = data["keys"]
+    timestamp = datetime.utcfromtimestamp(data['timestamp'] / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')
+
+    partition = data['partition']
+    offset = data['offset']
+    topic = data['topic']
+    schema = data['schema']
+
+    # Transform Avro schema to keep only the fields that are present in the payload
+    filtered_schema = []
+    for field in schema['fields']:
+        if "fields" in field['type']:
+            filtered_schema.append(field['type']['fields'])
+        else:
+            filtered_schema.append(field)
+
+
+    data = {
+        **keys,
+        "payload": data["value"],
+        "__operation": None,
+        "__event_timestamp": timestamp,
+        "__kafka_partition": partition,
+        "__kafka_offset": offset,
+        "__kafka_topic": topic,
+        "__schema": filtered_schema,
+        "__cluster": "my-cluster",
+        "__inserted_at": datetime.utcnow().isoformat()
+    }
+engine:
+  runner:
+    type: stream
+    log_level: WARNING

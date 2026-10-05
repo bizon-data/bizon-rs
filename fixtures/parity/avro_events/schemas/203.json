@@ -1,0 +1,40 @@
+{
+  "type": "record",
+  "name": "Ref",
+  "fields": [
+    {
+      "name": "id",
+      "type": "long"
+    },
+    {
+      "name": "account_id",
+      "type": "long"
+    },
+    {
+      "name": "c",
+      "type": {
+        "type": "record",
+        "name": "Customer",
+        "namespace": "x.fields",
+        "fields": [
+          {
+            "name": "a",
+            "type": "int"
+          },
+          {
+            "name": "b",
+            "type": [
+              "null",
+              "string"
+            ],
+            "default": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "c2",
+      "type": "x.fields.Customer"
+    }
+  ]
+}

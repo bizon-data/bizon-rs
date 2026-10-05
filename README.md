@@ -24,7 +24,20 @@ Kafka ──▶ decode (Avro via schema registry | UTF-8 JSON) ──▶ built-i
 
 ## Transforms
 
-Two built-ins cover the common streaming shapes:
+Six built-ins cover the common streaming shapes. Each takes `cluster` (written to `__cluster`); only
+`debezium_unwrap` takes anything else.
+
+| Built-in | Input | Row |
+|---|---|---|
+| `debezium_unwrap` | Avro Debezium envelope | `payload` = `after` (`before` for deletes), operation, deleted flag, record schema |
+| `avro_events` | Avro record | `payload` = the record; `__schema` = its top-level fields |
+| `cloudevents` | JSON, CloudEvents headers | `payload` = value; `ce_type`/`ce_id` required, `ce_time` optional |
+| `cloudevents_enriched` | JSON, any headers | as `cloudevents`, plus every header in `headers`; all `ce_*` optional |
+| `json_cdc` | JSON `{before, after}` | `payload` = `after`, `__before` = `before`, `ce_type`/`ce_id` headers |
+| `json_events` | JSON | `payload` = value |
+
+All of them also spread the message key's fields into the row and add the Kafka coordinates and event and
+insert timestamps.
 
 ```yaml
 transforms:
@@ -39,7 +52,7 @@ transforms:
 ```yaml
 transforms:
   - label: events
-    builtin: {name: cloudevents, cluster: my-cluster}   # payload = value, ce_type/ce_id/ce_time from headers
+    builtin: {name: cloudevents, cluster: my-cluster}   # or json_events, json_cdc, cloudevents_enriched, avro_events
 ```
 
 Configs that carry the equivalent inline `python` transforms (the templates in

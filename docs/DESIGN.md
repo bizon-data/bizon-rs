@@ -49,6 +49,9 @@ Python runtime. So:
     schema evolution; invalid, numeric-string and missing keys; bad framing; unknown schemas; truncated data;
     column deny-lists.
   - JSON: lone and paired surrogates; integers beyond 64 bits; missing, null and duplicate headers.
+  - Per transform: string and non-mapping keys, keys that collide with template columns, non-object values,
+    a missing `after` (`json_cdc`), and avro-events' `"fields" in field['type']` schema filter, which inlines
+    record fields as a nested list and fails on a type name that merely contains `fields`.
 - **Real captures.** The same test runs on any capture taken with `bizon-stream capture`.
 
 ## Deliberate divergences from bizon
@@ -63,6 +66,8 @@ Python runtime. So:
 - **Batching is streaming, not per poll.** Rows are batched per table by count, bytes and linger time. Request
   limits match bizon (`bq_max_rows_per_request`, under 10 MB per request, rows over 8 MiB through a load job),
   but batch boundaries differ.
+- **NaN or Infinity in a JSON-string key fails in the transform.** Python's `json.loads` accepts them, and bizon
+  then fails at encode, so both stop on the message; only the reported stage differs.
 - **`__inserted_at` is taken per message from the wall clock.** Values differ from bizon's by microseconds, so
   parity tests freeze the clock on both sides.
 

@@ -1,6 +1,7 @@
-//! Built-in replacements for the inline Python transforms production uses. A config's transform is
-//! accepted only if its code matches a known template once the per-pipeline literals (cluster name,
-//! column deny-list) are swapped for placeholders; anything else fails at startup.
+//! Built-in replacements for the inline Python transforms production uses. A config names one
+//! directly, or carries inline Python that is accepted only if it matches a known template once the
+//! per-pipeline literals (cluster name, column deny-list) are swapped for placeholders; anything else
+//! fails at startup.
 
 use std::collections::BTreeMap;
 
@@ -11,6 +12,21 @@ use crate::timefmt;
 
 const DEBEZIUM_TEMPLATE: &str = include_str!("templates/debezium.py");
 const CLOUDEVENTS_TEMPLATE: &str = include_str!("templates/cloudevents.py");
+const CLOUDEVENTS_ENRICHED_TEMPLATE: &str = include_str!("templates/cloudevents_enriched.py");
+const JSON_EVENTS_TEMPLATE: &str = include_str!("templates/json_events.py");
+const JSON_CDC_TEMPLATE: &str = include_str!("templates/json_cdc.py");
+const AVRO_EVENTS_TEMPLATE: &str = include_str!("templates/avro_events.py");
+
+type MakeBuiltin = fn(String) -> Builtin;
+
+/// Templates whose only per-pipeline literal is the cluster name.
+const CLUSTER_ONLY: [(&str, MakeBuiltin); 5] = [
+    (CLOUDEVENTS_TEMPLATE, |cluster| Builtin::CloudEvents { cluster }),
+    (CLOUDEVENTS_ENRICHED_TEMPLATE, |cluster| Builtin::CloudEventsEnriched { cluster }),
+    (JSON_EVENTS_TEMPLATE, |cluster| Builtin::JsonEvents { cluster }),
+    (JSON_CDC_TEMPLATE, |cluster| Builtin::JsonCdc { cluster }),
+    (AVRO_EVENTS_TEMPLATE, |cluster| Builtin::AvroEvents { cluster }),
+];
 
 const CLUSTER_PREFIX: &str = "\"__cluster\": \"";
 const DENY_LIST_PREFIX: &str = "TOPIC_COLUMN_TO_FILTER = ";
@@ -24,11 +40,21 @@ pub enum Builtin {
     },
     /// json-cloudevents (`label: parse_events`).
     CloudEvents { cluster: String },
+    /// json-cloudevents-enriched (`label: parse_events`).
+    CloudEventsEnriched { cluster: String },
+    /// json-events (`label: parse_events`).
+    JsonEvents { cluster: String },
+    /// json-cdc (`label: parse_events_with_after_payload`).
+    JsonCdc { cluster: String },
+    /// avro-events (`label: parse_avro_events`).
+    AvroEvents { cluster: String },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransformSelectionError {
-    #[error("transform `{label}` does not match a built-in template (only avro-cdc and json-cloudevents are supported)")]
+    #[error(
+        "transform `{label}` does not match a built-in template (supported: avro-cdc, avro-events, json-cdc, json-cloudevents, json-cloudevents-enriched, json-events)"
+    )]
     Unknown { label: String },
     #[error("transform `{label}`: {reason}")]
     Malformed { label: String, reason: String },
@@ -52,9 +78,9 @@ impl Builtin {
             let deny_list = parse_deny_list(&deny).map_err(|e| malformed(&format!("TOPIC_COLUMN_TO_FILTER: {e}")))?;
             return Ok(Builtin::Debezium { cluster, deny_list });
         }
-        if code == normalize(CLOUDEVENTS_TEMPLATE) {
+        if let Some((_, make)) = CLUSTER_ONLY.iter().find(|(template, _)| code == normalize(template)) {
             let cluster = cluster.ok_or_else(|| malformed("no __cluster literal"))?;
-            return Ok(Builtin::CloudEvents { cluster });
+            return Ok(make(cluster));
         }
         Err(TransformSelectionError::Unknown { label: label.to_string() })
     }
@@ -76,6 +102,8 @@ pub enum TransformError {
     NoBeforeFields,
     #[error("invalid JSON in string keys: {0}")]
     KeysJson(String),
+    #[error("{0} has an unexpected type")]
+    BadType(&'static str),
 }
 
 impl Builtin {
@@ -94,7 +122,10 @@ impl Builtin {
                 }
                 Ok(crate::json::to_string(&Value::Array(fields)))
             }
-            Builtin::CloudEvents { .. } => Ok(crate::json::to_string(schema)),
+            Builtin::AvroEvents { .. } => Ok(crate::json::to_string(&Value::Array(avro_events_schema(schema)?))),
+            Builtin::CloudEvents { .. } | Builtin::CloudEventsEnriched { .. } | Builtin::JsonEvents { .. } | Builtin::JsonCdc { .. } => {
+                Ok(crate::json::to_string(schema))
+            }
         }
     }
 
@@ -104,7 +135,18 @@ impl Builtin {
         match self {
             Builtin::Debezium { cluster, deny_list } => debezium(rec, value, schema_column, inserted_at, cluster, deny_list),
             Builtin::CloudEvents { cluster } => cloudevents(rec, value, schema_column, inserted_at, cluster),
+            Builtin::CloudEventsEnriched { cluster } => cloudevents_enriched(rec, value, schema_column, inserted_at, cluster),
+            Builtin::JsonEvents { cluster } | Builtin::AvroEvents { cluster } => events(rec, value, schema_column, inserted_at, cluster),
+            Builtin::JsonCdc { cluster } => json_cdc(rec, value, schema_column, inserted_at, cluster),
         }
+    }
+}
+
+/// The `if isinstance(keys, str): keys = json.loads(keys)` some templates start with.
+fn keys_from_text(keys: &Value) -> Result<Value, TransformError> {
+    match keys {
+        Value::String(s) => serde_json::from_str(s).map_err(|e| TransformError::KeysJson(e.to_string())),
+        other => Ok(other.clone()),
     }
 }
 
@@ -199,11 +241,7 @@ fn debezium(
 }
 
 fn cloudevents(rec: &Record<'_>, value: Value, schema_column: &str, inserted_at: &str, cluster: &str) -> Result<Row, TransformError> {
-    let keys = match &rec.keys {
-        Value::String(s) => serde_json::from_str(s).map_err(|e| TransformError::KeysJson(e.to_string()))?,
-        other => other.clone(),
-    };
-    let mut row = spread_keys(&keys)?;
+    let mut row = spread_keys(&keys_from_text(&rec.keys)?)?;
     let event_ts = event_timestamp(&Value::from(rec.timestamp_ms), "timestamp")?;
     let header = |name: &'static str| rec.headers.get(name).cloned();
     row.extend([
@@ -226,6 +264,113 @@ fn cloudevents(rec: &Record<'_>, value: Value, schema_column: &str, inserted_at:
         ("__inserted_at".to_string(), Value::from(inserted_at)),
     ]);
     Ok(row)
+}
+
+fn kafka_coordinates(rec: &Record<'_>) -> [(String, Value); 3] {
+    [
+        ("__kafka_partition".to_string(), Value::from(rec.partition)),
+        ("__kafka_offset".to_string(), Value::from(rec.offset)),
+        ("__kafka_topic".to_string(), Value::from(rec.topic)),
+    ]
+}
+
+fn header_or_null(rec: &Record<'_>, name: &str) -> Value {
+    rec.headers.get(name).cloned().unwrap_or(Value::Null)
+}
+
+fn cloudevents_enriched(
+    rec: &Record<'_>,
+    value: Value,
+    schema_column: &str,
+    inserted_at: &str,
+    cluster: &str,
+) -> Result<Row, TransformError> {
+    let mut row = spread_keys(&rec.keys)?;
+    let event_ts = event_timestamp(&Value::from(rec.timestamp_ms), "timestamp")?;
+    row.extend([
+        ("payload".to_string(), value),
+        ("headers".to_string(), Value::Object(rec.headers.clone())),
+        ("__ce_type".to_string(), header_or_null(rec, "ce_type")),
+        ("__ce_id".to_string(), header_or_null(rec, "ce_id")),
+        ("__ce_time".to_string(), header_or_null(rec, "ce_time")),
+        ("__event_timestamp".to_string(), Value::from(event_ts)),
+    ]);
+    row.extend(kafka_coordinates(rec));
+    row.extend([
+        ("__schema".to_string(), json_text(schema_column)),
+        ("__cluster".to_string(), Value::from(cluster)),
+        ("__inserted_at".to_string(), Value::from(inserted_at)),
+    ]);
+    Ok(row)
+}
+
+/// json-events and avro-events; they differ only in `__schema`, which `schema_column` computes.
+fn events(rec: &Record<'_>, value: Value, schema_column: &str, inserted_at: &str, cluster: &str) -> Result<Row, TransformError> {
+    let mut row = spread_keys(&rec.keys)?;
+    let event_ts = event_timestamp(&Value::from(rec.timestamp_ms), "timestamp")?;
+    row.extend([
+        ("payload".to_string(), value),
+        ("__operation".to_string(), Value::Null),
+        ("__event_timestamp".to_string(), Value::from(event_ts)),
+    ]);
+    row.extend(kafka_coordinates(rec));
+    row.extend([
+        ("__schema".to_string(), json_text(schema_column)),
+        ("__cluster".to_string(), Value::from(cluster)),
+        ("__inserted_at".to_string(), Value::from(inserted_at)),
+    ]);
+    Ok(row)
+}
+
+fn json_cdc(rec: &Record<'_>, value: Value, schema_column: &str, inserted_at: &str, cluster: &str) -> Result<Row, TransformError> {
+    let mut row = spread_keys(&keys_from_text(&rec.keys)?)?;
+    let event_ts = event_timestamp(&Value::from(rec.timestamp_ms), "timestamp")?;
+    let Value::Object(mut v) = value else {
+        return Err(TransformError::NotMapping("value"));
+    };
+    let after = v.remove("after").ok_or(TransformError::Missing("value.after"))?;
+    let before = v.remove("before").unwrap_or(Value::Null);
+    row.extend([
+        ("payload".to_string(), after),
+        ("__before".to_string(), before),
+        ("__ce_type".to_string(), header_or_null(rec, "ce_type")),
+        ("__ce_id".to_string(), header_or_null(rec, "ce_id")),
+        ("__event_timestamp".to_string(), Value::from(event_ts)),
+    ]);
+    row.extend(kafka_coordinates(rec));
+    row.extend([
+        ("__schema".to_string(), json_text(schema_column)),
+        ("__cluster".to_string(), Value::from(cluster)),
+        ("__inserted_at".to_string(), Value::from(inserted_at)),
+    ]);
+    Ok(row)
+}
+
+/// avro-events' `"fields" in field['type']`: a key test on a record type, a substring test on a type
+/// name and an element test on a union. A record's fields are appended as one nested list.
+fn avro_events_schema(schema: &Value) -> Result<Vec<Value>, TransformError> {
+    let Some(Value::Array(fields)) = schema.get("fields") else {
+        return Err(TransformError::Missing("schema.fields"));
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Value::Object(f) = field else {
+            return Err(TransformError::NotMapping("schema field"));
+        };
+        let ty = f.get("type").ok_or(TransformError::Missing("schema field type"))?;
+        let has_fields = match ty {
+            Value::Object(t) => t.contains_key("fields"),
+            Value::String(s) => s.contains("fields"),
+            Value::Array(a) => a.iter().any(|b| b == "fields"),
+            _ => return Err(TransformError::BadType("schema field type")),
+        };
+        out.push(match (has_fields, ty) {
+            (false, _) => field.clone(),
+            (true, Value::Object(t)) => t["fields"].clone(),
+            (true, _) => return Err(TransformError::BadType("schema field type")),
+        });
+    }
+    Ok(out)
 }
 
 /// `textwrap.dedent` plus trailing-whitespace trimming, so YAML indentation does not matter.

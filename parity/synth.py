@@ -5,7 +5,7 @@ Writes fixtures/configs/*.yml (configs the config tests parse) and fixtures/pari
 environment (needs fastavro and PyYAML), then regenerate golden output:
 
     cd <bizon-core checkout> && uv run python <this repo>/parity/synth.py --repo <this repo>
-    for c in debezium cloudevents; do
+    for c in debezium cloudevents json_events json_cdc cloudevents_enriched avro_events; do
       uv run python <this repo>/parity/golden.py --config <this repo>/fixtures/parity/$c/config.yml \
         --capture <this repo>/fixtures/parity/$c --out <this repo>/fixtures/parity/$c/golden.ndjson
     done
@@ -48,6 +48,19 @@ DEBEZIUM_COLUMNS = [
 CLOUDEVENTS_COLUMNS = [
     col("payload", "JSON"), col("__ce_type", "STRING"), col("__ce_id", "STRING"), col("__ce_time", "STRING"),
     col("__deleted", "BOOLEAN"), col("__cluster", "STRING"), col("__kafka_partition", "INTEGER"),
+    col("__kafka_offset", "INTEGER"), col("__kafka_topic", "STRING"), col("__schema", "JSON"),
+    col("__event_timestamp", "TIMESTAMP"), INSERTED_AT,
+]
+
+JSON_CDC_COLUMNS = [
+    col("payload", "JSON"), col("__before", "JSON"), col("__ce_type", "STRING"), col("__ce_id", "STRING"),
+    col("__deleted", "BOOLEAN"), col("__cluster", "STRING"), col("__kafka_partition", "INTEGER"),
+    col("__kafka_offset", "INTEGER"), col("__kafka_topic", "STRING"), col("__schema", "JSON"),
+    col("__event_timestamp", "TIMESTAMP"), INSERTED_AT,
+]
+CLOUDEVENTS_ENRICHED_COLUMNS = [
+    col("payload", "JSON"), col("headers", "JSON"), col("__ce_type", "STRING"), col("__ce_id", "STRING"),
+    col("__ce_time", "STRING"), col("__deleted", "BOOLEAN"), col("__cluster", "STRING"), col("__kafka_partition", "INTEGER"),
     col("__kafka_offset", "INTEGER"), col("__kafka_topic", "STRING"), col("__schema", "JSON"),
     col("__event_timestamp", "TIMESTAMP"), INSERTED_AT,
 ]
@@ -112,6 +125,14 @@ def example_configs(repo: Path):
                                    {"label": "debezium", "builtin": {"name": "debezium_unwrap", "cluster": CLUSTER, "columns_to_remove": deny}}),
         "cloudevents": config("cloudevents", "utf-8", CE_TOPICS, [col("accountId", "INTEGER")], CLOUDEVENTS_COLUMNS,
                               {"label": "parse_events", "python": template("cloudevents")}, skip_message_invalid_keys=True),
+        "cloudevents-enriched": config("cloudevents-enriched", "utf-8", CE_TOPICS, [col("accountId", "INTEGER")], CLOUDEVENTS_ENRICHED_COLUMNS,
+                                       {"label": "parse_events", "python": template("cloudevents_enriched")}),
+        "json-events": config("json-events", "utf-8", CE_TOPICS, [col("accountId", "INTEGER")], DEBEZIUM_COLUMNS,
+                              {"label": "parse_events", "python": template("json_events")}),
+        "json-cdc": config("json-cdc", "utf-8", [("app.cdc.documents", "my-project.cdc.documents")], [col("_id", "STRING")], JSON_CDC_COLUMNS,
+                           {"label": "parse_events_with_after_payload", "python": template("json_cdc")}),
+        "avro-events": config("avro-events", "avro", [("app.events.subscriptions", "my-project.events.subscriptions")], ID_KEY, DEBEZIUM_COLUMNS,
+                              {"label": "parse_avro_events", "python": template("avro_events")}),
         "unsupported": config("unsupported", "utf-8", CE_TOPICS, [col("accountId", "INTEGER")], CLOUDEVENTS_COLUMNS,
                               {"label": "parse_events", "python": "data = {'payload': data['value']}\n"}),
     }
@@ -275,6 +296,161 @@ def cloudevents_case(repo: Path):
     write(repo / "fixtures/parity/cloudevents", cfg, messages, {})
 
 
+def json_events_case(repo: Path):
+    k = lambda i, **extra: json.dumps({"account_id": i, "id": f"k{i}", **extra})
+    cases = [
+        (k(1), '{"a": 1, "b": [1, 2.5, null, true], "c": {"d": "e"}}'),
+        (k(2), '[1, 2, 3]'),
+        (k(3), '"just a string"'),
+        (k(4), '42'),
+        (k(5), 'null'),
+        ('"{\\"account_id\\": 6}"', '{"a": 1}'),  # keys as a JSON string: not parsed by this template
+        (None, '{"a": 1}'),  # no key: REQUIRED account_id missing
+        ('[1]', '{"a": 1}'),  # key not a mapping
+        (k(9, __operation="from-key"), '{"a": 1}'),  # overwritten by the template's None
+        (k(10, payload="from-key"), '{"a": 1}'),
+        (k(11, started="2026-01-01T00:00:00Z"), '{"a": 1}'),
+        (k(12, started=1700000000), '{"a": 1}'),  # int into a TIMESTAMP (string) column
+        (k(13, unknown=1), '{"a": 1}'),
+        (k(14), '{"x": "\\ud83d\\ude00 pair, lone \\udf31, ctl \x01, é ✓"}'),
+        (k(15), b'{"x": "bad \xff utf8"}'),
+        (k(16), '{not json'),
+        (k(17), None),
+        (k(18), b""),
+        (json.dumps({"account_id": "19", "id": "k19"}), '{"big": 18446744073709551615, "f": 1e20, "g": 1.5e-7, "i": -0.0}'),
+        (json.dumps({"account_id": "x20", "id": "k20"}), '{"a": 1}'),
+        (k(21), '{"k": "v", "k": "w"}'),
+        (k(22), '{"a": 1}'),
+    ]
+    messages = [msg("je.a", i, key, value, [("ce_type", "t")] if i % 2 else None) for i, (key, value) in enumerate(cases)]
+    messages[-1]["timestamp"] = -1
+
+    keys = [col("account_id", "INTEGER", "REQUIRED"), col("id", "STRING"), col("started", "TIMESTAMP")]
+    cfg = config("synth-json-events", "utf-8", [("je.a", "p.d.je")], keys, DEBEZIUM_COLUMNS, {"label": "parse_events", "python": template("json_events")})
+    write(repo / "fixtures/parity/json_events", cfg, messages, {})
+
+
+def json_cdc_case(repo: Path):
+    k = lambda i, **extra: json.dumps({"account_id": i, "_id": f"o{i}", **extra})
+    ce = [("ce_type", "product.updated"), ("ce_id", "abc")]
+    cases = [
+        (k(1), '{"before": null, "after": {"name": "x", "n": [1, 2]}}', ce),
+        (k(2), '{"before": {"name": "x"}, "after": {"name": "y"}}', ce),
+        (k(3), '{"after": {"name": "no before"}}', ce),
+        (k(4), '{"before": {"name": "deleted"}}', ce),  # no after: KeyError
+        (k(5), '{"before": {"name": "x"}, "after": null}', ce),
+        (k(6), '[{"after": 1}]', ce),
+        (k(7), '"after"', ce),
+        (k(8), 'null', ce),
+        (json.dumps(json.dumps({"account_id": 9, "_id": "o9"})), '{"after": {"a": 1}}', ce),  # keys as a JSON string
+        (json.dumps("nope"), '{"after": {"a": 1}}', ce),
+        (json.dumps("[1]"), '{"after": {"a": 1}}', ce),
+        (k(12), '{"after": {"a": 1}}', None),  # no headers
+        (k(13), '{"after": {"a": 1}}', [("ce_type", "only-type")]),
+        (k(14), '{"after": {"x": "\\ud83d\\ude00 é ✓ \\u0000"}}', ce),
+        (k(15), '{"after": [1, "two", null]}', ce),
+        (k(16), '{"after": "a string"}', ce),
+        (k(17, __before="from-key"), '{"after": {"a": 1}}', ce),
+        (k(18), '{"after": {"a": 1}}', [("ce_id", "1"), ("ce_id", "2")]),
+        (k(19), '{"after": {"f": 1e20, "g": 0.1, "big": 18446744073709551615}}', ce),
+        (json.dumps('{"account_id": NaN, "_id": "o20"}'), '{"after": {"a": 1}}', ce),  # json.loads accepts NaN
+        (k(21), '{"after": {"a": 1}, "before": {"a": 0}, "extra": true}', ce),
+        (k(22), '{"after": {"a": 1}}', ce),
+    ]
+    messages = [msg("jc.a", i, key, value, headers) for i, (key, value, headers) in enumerate(cases)]
+    messages[-1]["timestamp"] = -1
+
+    keys = [col("account_id", "INTEGER", "REQUIRED"), col("_id", "STRING")]
+    cfg = config("synth-json-cdc", "utf-8", [("jc.a", "p.d.jc")], keys, JSON_CDC_COLUMNS, {"label": "parse_events_with_after_payload", "python": template("json_cdc")})
+    write(repo / "fixtures/parity/json_cdc", cfg, messages, {})
+
+
+def cloudevents_enriched_case(repo: Path):
+    k = lambda i, **extra: json.dumps({"_id": f"o{i}", "account_id": i, **extra})
+    full = [("ce_type", "order.created"), ("ce_id", "1"), ("ce_time", "2026-01-01T00:00:00Z"), ("traceparent", "00-abc-01")]
+    cases = [
+        (k(1), '{"a": 1, "b": {"c": [1, 2]}}', full),
+        (k(2), '{"a": 1}', None),  # no headers: {} and null ce_* columns
+        (k(3), '{"a": 1}', [("ce_type", "only-type")]),
+        (k(4), '{"a": 1}', [("ce_id", "1"), ("ce_id", "2")]),
+        (k(5), '{"a": 1}', [("ce_type", "t"), ("ce_id", None)]),
+        (k(6), '{"a": 1}', [("x-note", "é ✓ 😀")]),
+        (json.dumps(json.dumps({"_id": "o7", "account_id": 7})), '{"a": 1}', full),  # keys string: not parsed here
+        (k(8), '[1, 2]', full),
+        (k(9), '"s"', full),
+        (k(10, headers="from-key"), '{"a": 1}', full),
+        (json.dumps({"account_id": 11}), '{"a": 1}', full),  # REQUIRED _id missing
+        ("nope", '{"a": 1}', full),
+        (k(13), None, full),
+        (k(14), '{"x": "\\udf31 lone"}', full),
+        (k(15), '{"a": 1}', full),
+    ]
+    messages = [msg("cee.a", i, key, value, headers) for i, (key, value, headers) in enumerate(cases)]
+    messages[-1]["timestamp"] = -1
+
+    keys = [col("account_id", "INTEGER", "REQUIRED"), col("_id", "STRING", "REQUIRED")]
+    cfg = config("synth-cloudevents-enriched", "utf-8", [("cee.a", "p.d.cee")], keys, CLOUDEVENTS_ENRICHED_COLUMNS, {"label": "parse_events", "python": template("cloudevents_enriched")})
+    write(repo / "fixtures/parity/cloudevents_enriched", cfg, messages, {})
+
+
+INNER = {"type": "record", "name": "Customer", "namespace": "x.fields", "fields": [{"name": "a", "type": "int"}, {"name": "b", "type": ["null", "string"], "default": None}]}
+EVENT = {
+    "type": "record",
+    "name": "Subscription",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "account_id", "type": "long"},
+        {"name": "name", "type": ["null", "string"], "default": None},
+        {"name": "customer", "type": INNER},
+        {"name": "maybe_customer", "type": ["null", "x.fields.Customer"], "default": None},
+        {"name": "status", "type": {"type": "enum", "name": "Status", "symbols": ["ACTIVE", "CANCELED"]}},
+        {"name": "tags", "type": {"type": "array", "items": "string"}},
+        {"name": "amount", "type": ["null", "double"], "default": None},
+        {"name": "created", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    ],
+}
+EVENT_V2 = copy.deepcopy(EVENT)
+EVENT_V2["fields"].append({"name": "plan", "type": ["null", "string"], "default": None})
+# A named-type reference whose name contains "fields": the template's substring test then indexes a str.
+EVENT_REF = {"type": "record", "name": "Ref", "fields": [{"name": "id", "type": "long"}, {"name": "account_id", "type": "long"}, {"name": "c", "type": INNER}, {"name": "c2", "type": "x.fields.Customer"}]}
+EVENT_SCHEMAS = {201: EVENT, 202: EVENT_V2, 203: EVENT_REF}
+
+
+def avro_events_case(repo: Path):
+    def ev(i, schema_id=201, **over):
+        r = {"id": i, "account_id": i, "name": f"sub {i}", "customer": {"a": i, "b": None}, "maybe_customer": None, "status": "ACTIVE", "tags": ["a"], "amount": 9.99, "created": 1700000000123}
+        if schema_id == 203:
+            r = {"id": i, "account_id": i, "c": {"a": 1, "b": "x"}, "c2": {"a": 2, "b": None}}
+        r.update(over)
+        buf = io.BytesIO()
+        fastavro.schemaless_writer(buf, fastavro.parse_schema(copy.deepcopy(EVENT_SCHEMAS[schema_id])), r)
+        return b"\x00" + struct.pack(">I", schema_id) + buf.getvalue()
+
+    k = lambda i: json.dumps({"account_id": i, "id": i})
+    cases = [
+        (k(1), ev(1)),
+        (k(2), ev(2, name="é ✓ 😀 \x01", maybe_customer={"a": 5, "b": "y"})),
+        (k(3), ev(3, status="CANCELED", tags=[], amount=None)),
+        (k(4), ev(4, amount=1e20)),
+        (k(5), ev(5, schema_id=202, plan="pro")),
+        (k(6), ev(6, schema_id=203)),
+        (k(7), b"\x00\x00\x00\x03\xe7\x00"),  # unknown schema id 999
+        (k(8), None),
+        (json.dumps(json.dumps({"account_id": 9, "id": 9})), ev(9)),  # keys string: not parsed here
+        (json.dumps({"account_id": 10}), ev(10)),  # REQUIRED id missing
+        (k(11), ev(11, created=-1)),
+        (k(13), ev(13, amount=float("nan"))),
+        (k(14), ev(14, amount=float("-inf"))),
+        (k(12), ev(12)),
+    ]
+    messages = [msg("ae.a", i, key, value) for i, (key, value) in enumerate(cases)]
+    messages[-1]["timestamp"] = -1
+
+    keys = [col("account_id", "INTEGER", "REQUIRED"), col("id", "INTEGER", "REQUIRED")]
+    cfg = config("synth-avro-events", "avro", [("ae.a", "p.d.ae")], keys, DEBEZIUM_COLUMNS, {"label": "parse_avro_events", "python": template("avro_events")})
+    write(repo / "fixtures/parity/avro_events", cfg, messages, EVENT_SCHEMAS)
+
+
 def write(dir: Path, cfg, messages, schemas):
     (dir / "schemas").mkdir(parents=True, exist_ok=True)
     (dir / "config.yml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
@@ -292,3 +468,7 @@ if __name__ == "__main__":
     example_configs(a.repo)
     debezium_case(a.repo)
     cloudevents_case(a.repo)
+    json_events_case(a.repo)
+    json_cdc_case(a.repo)
+    cloudevents_enriched_case(a.repo)
+    avro_events_case(a.repo)
