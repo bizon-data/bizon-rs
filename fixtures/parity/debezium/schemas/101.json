@@ -1,0 +1,187 @@
+{
+  "type": "record",
+  "name": "synth.public.thing.Envelope",
+  "fields": [
+    {
+      "name": "before",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "Value",
+          "fields": [
+            {
+              "name": "id",
+              "type": "long"
+            },
+            {
+              "name": "name",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "score",
+              "type": [
+                "null",
+                "double"
+              ],
+              "default": null
+            },
+            {
+              "name": "ratio",
+              "type": "float"
+            },
+            {
+              "name": "flag",
+              "type": "boolean"
+            },
+            {
+              "name": "tags",
+              "type": {
+                "type": "array",
+                "items": "string"
+              }
+            },
+            {
+              "name": "attrs",
+              "type": {
+                "type": "map",
+                "values": "long"
+              }
+            },
+            {
+              "name": "status",
+              "type": {
+                "type": "enum",
+                "name": "Status",
+                "symbols": [
+                  "ACTIVE",
+                  "DELETED"
+                ]
+              }
+            },
+            {
+              "name": "blob",
+              "type": [
+                "null",
+                "bytes"
+              ],
+              "default": null
+            },
+            {
+              "name": "created",
+              "type": {
+                "type": "long",
+                "logicalType": "timestamp-millis"
+              }
+            },
+            {
+              "name": "updated",
+              "type": {
+                "type": "long",
+                "logicalType": "timestamp-micros"
+              }
+            },
+            {
+              "name": "day",
+              "type": {
+                "type": "int",
+                "logicalType": "date"
+              }
+            },
+            {
+              "name": "ext",
+              "type": [
+                "null",
+                {
+                  "type": "string",
+                  "logicalType": "uuid"
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "secret",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "nested",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "Inner",
+                  "fields": [
+                    {
+                      "name": "a",
+                      "type": "int"
+                    }
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "count",
+              "type": "int",
+              "connect.default": 0,
+              "default": 0
+            }
+          ]
+        }
+      ],
+      "default": null
+    },
+    {
+      "name": "after",
+      "type": [
+        "null",
+        "Value"
+      ],
+      "default": null
+    },
+    {
+      "name": "source",
+      "type": {
+        "type": "record",
+        "name": "Source",
+        "namespace": "io.debezium",
+        "fields": [
+          {
+            "name": "ts_ms",
+            "type": [
+              "null",
+              "long"
+            ]
+          },
+          {
+            "name": "db",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "op",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "name": "ts_ms",
+      "type": [
+        "null",
+        "long"
+      ]
+    }
+  ],
+  "connect.name": "synth.public.thing.Envelope"
+}

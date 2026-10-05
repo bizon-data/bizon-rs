@@ -1,0 +1,193 @@
+name: avro-cdc
+source:
+  name: kafka
+  stream: topic
+  sync_mode: stream
+  force_ignore_checkpoint: false
+  topics:
+  - name: app.cdc.orders
+    destination_id: my-project.cdc.orders
+  - name: app.cdc.users
+    destination_id: my-project.cdc.users
+  batch_size: BIZON_ENV_BATCH_SIZE
+  consumer_timeout: BIZON_ENV_CONSUMER_TIMEOUT
+  bootstrap_servers: BIZON_ENV_BOOTSTRAP_SERVERS
+  group_id: my-consumer-group
+  consumer_config:
+    auto.offset.reset: earliest
+    enable.auto.commit: false
+    session.timeout.ms: 60000
+    security.protocol: SASL_SSL
+    partition.assignment.strategy: cooperative-sticky
+  authentication:
+    type: basic
+    schema_registry_url: BIZON_ENV_APICURIO_URL
+    schema_registry_username: BIZON_ENV_APICURIO_USER
+    schema_registry_password: BIZON_ENV_APICURIO_PASSWORD
+    params:
+      username: BIZON_ENV_KAFKA_USERNAME
+      password: BIZON_ENV_KAFKA_PASSWORD
+destination:
+  name: bigquery_streaming_v2
+  config:
+    dataset_id: BIZON_ENV_DATASET_ID
+    dataset_location: BIZON_ENV_DATASET_LOCATION
+    project_id: BIZON_ENV_PROJECT_ID
+    bq_max_rows_per_request: BIZON_ENV_BQ_MAX_ROWS_PER_REQUEST
+    max_concurrent_threads: BIZON_ENV_BQ_MAX_CONCURRENT_THREADS
+    unnest: true
+    time_partitioning:
+      type: DAY
+      field: __inserted_at
+    record_schemas:
+    - destination_id: my-project.cdc.orders
+      record_schema:
+      - &id001
+        name: id
+        type: INTEGER
+        mode: REQUIRED
+      - name: payload
+        type: JSON
+        mode: NULLABLE
+      - name: __operation
+        type: STRING
+        mode: NULLABLE
+      - name: __deleted
+        type: BOOLEAN
+        mode: NULLABLE
+      - name: __cluster
+        type: STRING
+        mode: NULLABLE
+      - name: __kafka_partition
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_offset
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_topic
+        type: STRING
+        mode: NULLABLE
+      - name: __schema
+        type: JSON
+        mode: NULLABLE
+      - name: __event_timestamp
+        type: TIMESTAMP
+        mode: NULLABLE
+      - name: __inserted_at
+        type: TIMESTAMP
+        mode: NULLABLE
+        default_value_expression: CURRENT_TIMESTAMP()
+      clustering_keys:
+      - id
+    - destination_id: my-project.cdc.users
+      record_schema:
+      - *id001
+      - name: payload
+        type: JSON
+        mode: NULLABLE
+      - name: __operation
+        type: STRING
+        mode: NULLABLE
+      - name: __deleted
+        type: BOOLEAN
+        mode: NULLABLE
+      - name: __cluster
+        type: STRING
+        mode: NULLABLE
+      - name: __kafka_partition
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_offset
+        type: INTEGER
+        mode: NULLABLE
+      - name: __kafka_topic
+        type: STRING
+        mode: NULLABLE
+      - name: __schema
+        type: JSON
+        mode: NULLABLE
+      - name: __event_timestamp
+        type: TIMESTAMP
+        mode: NULLABLE
+      - name: __inserted_at
+        type: TIMESTAMP
+        mode: NULLABLE
+        default_value_expression: CURRENT_TIMESTAMP()
+      clustering_keys:
+      - id
+transforms:
+- label: debezium
+  python: |
+    from datetime import datetime
+    import orjson
+
+    partition = data['partition']
+    offset = data['offset']
+    topic = data['topic']
+    schema = data['schema']
+    keys = data['keys'] # Parse kafka message keys, we extract all of them
+    operation = data['value']['op']
+
+    # Retrieve timestamp when event has been emitted by debezium in Kafka
+    # Same behavior as Kafka Connect Debezium transfo
+    kafka_timestamp = datetime.utcfromtimestamp(data['value']['source']['ts_ms'] / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')
+
+    # Debezium SMT implementation
+    deleted = False
+
+    if data['value']['op'] == 'd':
+      payload = data['value']['before']
+      deleted = True
+    else:
+      payload = data['value']['after']
+
+    # Transform Avro schema to keep only the fields that are present in the payload
+    filtered_schema = []
+    for field in schema['fields']:
+      if field['name'] == 'before':
+        for before_type in field['type']:
+          if "fields" in before_type:
+            filtered_schema = before_type['fields']
+            break
+
+    if not filtered_schema:
+      raise Exception("No fields found in the Avro schema, please check the schema and custom transform")
+
+    # --- Filtering configuration ---
+    # Mapping from topic name to filter out columns from payload
+    # Example topic-specific filters:
+    # {'topic-name': ['colA', 'colB'], 'topic-name-2': ['colC', 'colD']}
+
+    TOPIC_COLUMN_TO_FILTER = {'app.cdc.users': ['password_hash']}
+
+    # --- Filter payload columns based on topic if applicable ---
+    filtered_columns = TOPIC_COLUMN_TO_FILTER.get(topic, None) # Returns a list
+
+    # Delete all filtered_columns from payload and filtered_schema
+    if filtered_columns:
+      for filtered_column in filtered_columns:
+        payload.pop(filtered_column, None)
+
+      new_filtered_schema = []
+      for f in filtered_schema:
+        if f['name'] not in filtered_columns:
+          new_filtered_schema.append(f)
+      filtered_schema = new_filtered_schema
+
+    data = {
+      **keys,
+      "payload": orjson.dumps(payload).decode('utf-8'),
+      "__operation": operation,
+      "__deleted": deleted,
+      "__cluster": "my-cluster",
+      "__kafka_partition": partition,
+      "__kafka_offset": offset,
+      "__kafka_topic": topic,
+      "__schema": filtered_schema,
+      "__event_timestamp": kafka_timestamp,
+      "__inserted_at": datetime.utcnow().isoformat()
+    }
+engine:
+  runner:
+    type: stream
+    log_level: WARNING
