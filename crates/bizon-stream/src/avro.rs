@@ -21,7 +21,11 @@ enum Logical {
     TimeMillis,
     TimeMicros,
     Uuid,
-    Decimal,
+    /// `precision` is required by fastavro at decode time, so a missing one fails the record there.
+    Decimal {
+        precision: Option<u32>,
+        scale: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -90,7 +94,10 @@ fn logical(v: &Value, base: &str) -> Logical {
         ("int", Some("time-millis")) => Logical::TimeMillis,
         ("long", Some("time-micros")) => Logical::TimeMicros,
         ("string", Some("uuid")) => Logical::Uuid,
-        ("bytes" | "fixed", Some("decimal")) => Logical::Decimal,
+        ("bytes" | "fixed", Some("decimal")) => Logical::Decimal {
+            precision: v.get("precision").and_then(Value::as_u64).map(|p| p as u32),
+            scale: v.get("scale").and_then(Value::as_u64).unwrap_or(0) as u32,
+        },
         _ => Logical::None,
     }
 }
@@ -341,11 +348,59 @@ fn blocks(d: &mut &[u8], mut item: impl FnMut(&mut &[u8]) -> Result<(), AvroErro
 }
 
 fn bytes_value(b: &[u8], lt: Logical) -> Result<Value, AvroError> {
-    if lt == Logical::Decimal {
-        return Err(AvroError::Unsupported("decimal logical type"));
+    if let Logical::Decimal { precision, scale } = lt {
+        return decimal(b, precision.ok_or(AvroError::Schema("decimal without precision".into()))?, scale);
     }
     // bizon's orjson default decodes bytes as strict UTF-8; anything else fails the record.
     Ok(Value::from(std::str::from_utf8(b).map_err(|_| AvroError::Utf8("bytes"))?))
+}
+
+/// What bizon ends up with for a decimal: fastavro rounds the unscaled value to `precision` digits
+/// (half-even) and applies `scaleb(-scale)`; the frame stores `str(Decimal)`, which the transform
+/// reads back with `json.loads`. That gives an int only when the final exponent is 0, otherwise the
+/// correctly rounded float.
+fn decimal(b: &[u8], precision: u32, scale: u32) -> Result<Value, AvroError> {
+    if b.len() > 16 {
+        return Err(AvroError::Unsupported("decimal wider than 128 bits"));
+    }
+    let mut unscaled: i128 = if b.first().is_some_and(|x| x & 0x80 != 0) { -1 } else { 0 };
+    for &x in b {
+        unscaled = (unscaled << 8) | x as i128;
+    }
+    let negative = unscaled < 0;
+    let mut coefficient = unscaled.unsigned_abs();
+    let mut exponent = -(scale as i64);
+    let digits = if coefficient == 0 { 1 } else { coefficient.ilog10() + 1 };
+    if precision == 0 {
+        return Err(AvroError::Schema("decimal precision must be positive".into()));
+    }
+    if digits > precision {
+        let drop = digits - precision;
+        let div = 10u128.pow(drop);
+        let (q, r) = (coefficient / div, coefficient % div);
+        let half = div / 2;
+        coefficient = if r > half || (r == half && q % 2 == 1) { q + 1 } else { q };
+        exponent += drop as i64;
+        if coefficient == 10u128.pow(precision) {
+            coefficient /= 10;
+            exponent += 1;
+        }
+    }
+    let sign = if negative { "-" } else { "" };
+    if exponent == 0 {
+        let n = i128::try_from(coefficient).ok().map(|c| if negative { -c } else { c });
+        let int = n.and_then(|n| {
+            i64::try_from(n)
+                .map(Value::from)
+                .or_else(|_| u64::try_from(n).map(Value::from))
+                .ok()
+        });
+        return int.ok_or(AvroError::Unsupported("integer decimal beyond 64 bits"));
+    }
+    let f: f64 = format!("{sign}{coefficient}e{exponent}")
+        .parse()
+        .map_err(|_| AvroError::Unsupported("decimal value"))?;
+    Ok(Value::from(f))
 }
 
 fn time_of_day(micros: i64) -> String {

@@ -5,7 +5,7 @@ Writes fixtures/configs/*.yml (configs the config tests parse) and fixtures/pari
 environment (needs fastavro and PyYAML), then regenerate golden output:
 
     cd <bizon-core checkout> && uv run python <this repo>/parity/synth.py --repo <this repo>
-    for c in debezium cloudevents json_events json_cdc cloudevents_enriched avro_events; do
+    for c in debezium cloudevents json_events json_cdc cloudevents_enriched avro_events decimal; do
       uv run python <this repo>/parity/golden.py --config <this repo>/fixtures/parity/$c/config.yml \
         --capture <this repo>/fixtures/parity/$c --out <this repo>/fixtures/parity/$c/golden.ndjson
     done
@@ -451,6 +451,80 @@ def avro_events_case(repo: Path):
     write(repo / "fixtures/parity/avro_events", cfg, messages, EVENT_SCHEMAS)
 
 
+def decimal_case(repo: Path):
+    def dec(precision, scale, fixed=None):
+        if fixed:
+            return {"type": "fixed", "name": fixed, "size": 8, "logicalType": "decimal", "precision": precision, "scale": scale}
+        return {"type": "bytes", "logicalType": "decimal", "precision": precision, "scale": scale}
+
+    fields = [
+        ("id", "long"),
+        ("amount", dec(10, 2)),
+        ("big_int", dec(38, 0)),
+        ("tiny", dec(20, 10)),
+        ("rounded", dec(3, 0)),
+        ("fixed_amount", dec(18, 9, fixed="FixedAmount")),
+        ("maybe", ["null", dec(12, 4)]),
+        ("carry", dec(3, 1)),
+    ]
+    value = {"type": "record", "name": "Value", "fields": [{"name": n, "type": t} for n, t in fields]}
+    registry = {301: envelope(value)}
+    # The writer sees plain bytes/fixed, so values can carry more digits than the declared precision.
+    raw = {"type": "record", "name": "Value", "fields": [
+        {"name": n, "type": ("long" if t == "long" else ["null", "bytes"] if isinstance(t, list) else
+                             {"type": "fixed", "name": "FixedAmount", "size": 8} if isinstance(t, dict) and t["type"] == "fixed" else "bytes")}
+        for n, t in fields
+    ]}
+    writer = {"type": "record", "name": "Envelope", "fields": [
+        {"name": "before", "type": ["null", raw], "default": None},
+        {"name": "after", "type": ["null", "Value"], "default": None},
+        {"name": "source", "type": {"type": "record", "name": "Source", "fields": [
+            {"name": "ts_ms", "type": ["null", "long"]}, {"name": "db", "type": "string"}]}},
+        {"name": "op", "type": ["null", "string"]},
+        {"name": "ts_ms", "type": ["null", "long"]},
+    ]}
+
+    def b(n, size=None):
+        length = size or max(1, (n.bit_length() + 8) // 8)
+        return n.to_bytes(length, "big", signed=True)
+
+    def row(i, amount=12345, big_int=42, tiny=1, rounded=7, fixed_amount=1500000000, maybe=None, carry=12):
+        return {"id": i, "amount": b(amount), "big_int": b(big_int), "tiny": b(tiny), "rounded": b(rounded),
+                "fixed_amount": b(fixed_amount, 8), "maybe": None if maybe is None else b(maybe), "carry": b(carry)}
+
+    def msg_value(r, op="c"):
+        buf = io.BytesIO()
+        fastavro.schemaless_writer(buf, fastavro.parse_schema(writer), {"before": None, "after": r, "source": {"ts_ms": 1700000000456, "db": "x"}, "op": op, "ts_ms": 1})
+        return b"\x00" + struct.pack(">I", 301) + buf.getvalue()
+
+    k = lambda i: json.dumps({"id": i})
+    cases = [
+        row(1),
+        row(2, amount=-12345, big_int=-42, tiny=-1, fixed_amount=-1),
+        row(3, amount=0, big_int=0, tiny=0, rounded=0, fixed_amount=0, maybe=0),
+        row(4, amount=100, maybe=10000),
+        row(5, amount=9999999999, big_int=10**37, tiny=10**19 + 1),
+        row(6, big_int=9223372036854775807),
+        row(7, big_int=9223372036854775808),
+        row(8, big_int=-9223372036854775808),
+        row(9, rounded=12345),
+        row(10, rounded=99950),
+        row(11, rounded=12350),
+        row(12, rounded=12250),
+        row(13, rounded=-99960),
+        row(14, amount=1, tiny=12345678901234567890),
+        row(15, amount=123456789012, maybe=-5),
+        row(16, fixed_amount=2**63 - 1),
+        row(17, amount=2**70),
+        row(18, carry=9995),  # rounds up to 1.00E+3: a float, although the exponent would be 0 without the carry
+        row(19, carry=1234),  # rounds to exactly 123: an int
+    ]
+    messages = [msg("dec.a", i, k(i), msg_value(r)) for i, r in enumerate(cases)]
+
+    cfg = config("synth-decimal", "avro", [("dec.a", "p.d.dec")], ID_KEY, DEBEZIUM_COLUMNS,
+                 {"label": "debezium", "python": template("debezium")})
+    write(repo / "fixtures/parity/decimal", cfg, messages, registry)
+
 def write(dir: Path, cfg, messages, schemas):
     (dir / "schemas").mkdir(parents=True, exist_ok=True)
     (dir / "config.yml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
@@ -472,3 +546,4 @@ if __name__ == "__main__":
     json_cdc_case(a.repo)
     cloudevents_enriched_case(a.repo)
     avro_events_case(a.repo)
+    decimal_case(a.repo)
