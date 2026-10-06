@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use bizon_stream::avro::AvroError;
 use bizon_stream::config::Config;
 use bizon_stream::kafka::message::{MessageParser, RawMessage};
 use bizon_stream::kafka::registry::{Registry, RegistrySchema};
@@ -70,6 +71,11 @@ fn synthetic_json_cdc() {
 #[test]
 fn synthetic_avro_events() {
     synthetic("avro_events");
+}
+
+#[test]
+fn synthetic_decimal() {
+    synthetic("decimal");
 }
 
 #[test]
@@ -146,6 +152,10 @@ fn assert_parity(capture: &std::path::Path, config: &std::path::Path) {
             ("error", Err(e)) if g["stage"] == e.stage() || (g["stage"] == "frame" && e.stage() == "source") => Ok(()),
             // json.loads accepts NaN/Infinity in string keys and bizon fails later, at encode; see docs/decisions.md.
             ("error", Err(PipelineError::Transform(TransformError::KeysJson(_)))) if g["stage"] == "encode" => Ok(()),
+            // A scale-0 decimal beyond 64 bits: orjson refuses it in bizon's transform, serde_json while decoding.
+            ("error", Err(PipelineError::Avro(AvroError::Unsupported("integer decimal beyond 64 bits")))) if g["stage"] == "transform" => {
+                Ok(())
+            }
             (want, got) => Err(format!(
                 "python {want} ({}) vs rust {:?}",
                 g["error"],

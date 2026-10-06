@@ -21,6 +21,8 @@ serves one constraint: **a row written by bizon-rs must be byte-identical to the
 3. **Decode.**
    - Avro uses Confluent 4-byte or Apicurio 8-byte framing and a schema-driven decoder (`avro.rs`) straight to
      JSON values. Field order is kept, and logical types are rendered the way fastavro and orjson render them.
+     Decimals follow bizon's round trip: fastavro's rounding to `precision`, then `str(Decimal)` read back by
+     `json.loads`, which gives an int only when the final exponent is 0.
    - UTF-8 JSON has bizon's surrogate and control-character sanitising.
 4. **Transform.** Native built-ins (`transform/`). `__schema` depends only on the schema and topic, so it is
    computed once per (schema id, topic) and reused.
@@ -66,6 +68,8 @@ Python runtime. So:
 - **Batching is streaming, not per poll.** Rows are batched per table by count, bytes and linger time. Request
   limits match bizon (`bq_max_rows_per_request`, under 10 MB per request, rows over 8 MiB through a load job),
   but batch boundaries differ.
+- **A scale-0 Avro decimal beyond 64 bits fails while decoding.** orjson refuses the integer later, in bizon's
+  transform, so both stop on the message; only the reported stage differs.
 - **NaN or Infinity in a JSON-string key fails in the transform.** Python's `json.loads` accepts them, and bizon
   then fails at encode, so both stop on the message; only the reported stage differs.
 - **`__inserted_at` is taken per message from the wall clock.** Values differ from bizon's by microseconds, so
