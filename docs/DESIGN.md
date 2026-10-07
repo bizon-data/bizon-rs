@@ -26,6 +26,9 @@ serves one constraint: **a row written by bizon-rs must be byte-identical to the
    - UTF-8 JSON has bizon's surrogate and control-character sanitising.
 4. **Transform.** Native built-ins (`transform/`). `__schema` depends only on the schema and topic, so it is
    computed once per (schema id, topic) and reused.
+   Steps 3–5 run on a bounded window of blocking tasks (`BIZON_RS_DECODE_WINDOW`, default 4), so one busy
+   partition isn't limited to one core. Messages are read, tracked and handed to the table writers in delivery
+   order, so acks, commits and error handling are unchanged.
 5. **Encode.** A hand-written proto2 encoder (`proto/encode.rs`) over a descriptor built like bizon's
    `proto_utils`. It reproduces both of bizon's paths: protobuf's constructor fast path, and the `ParseDict`
    fallback that, for example, turns `"30"` into an INT64 30.

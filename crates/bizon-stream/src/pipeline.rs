@@ -74,13 +74,17 @@ pub fn cell(v: &Value) -> Cell<'_> {
 pub struct Pipeline<'a> {
     parser: &'a MessageParser,
     transform: &'a Builtin,
-    tables: &'a dyn Fn(&str) -> Option<&'a TableDescriptor>,
+    tables: &'a (dyn Fn(&str) -> Option<&'a TableDescriptor> + Sync),
     /// `__schema` text per (registry id, topic); -1 stands for JSON messages, which have no schema.
     schema_columns: RwLock<HashMap<(i64, String), Arc<str>>>,
 }
 
 impl<'a> Pipeline<'a> {
-    pub fn new(parser: &'a MessageParser, transform: &'a Builtin, tables: &'a dyn Fn(&str) -> Option<&'a TableDescriptor>) -> Self {
+    pub fn new(
+        parser: &'a MessageParser,
+        transform: &'a Builtin,
+        tables: &'a (dyn Fn(&str) -> Option<&'a TableDescriptor> + Sync),
+    ) -> Self {
         Self {
             parser,
             transform,

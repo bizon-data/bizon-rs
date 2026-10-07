@@ -91,6 +91,8 @@ bizon's config come from `BIZON_RS_*` variables:
 | `BIZON_RS_QUEUE_KBYTES` | 16384 | librdkafka `queued.max.messages.kbytes` |
 | `BIZON_RS_HEALTH_PORT` | 8080 | `/healthz`, `/readyz`, `/metrics` |
 | `BIZON_RS_DRAIN_SECS` | 20 | SIGTERM drain budget |
+| `BIZON_RS_DECODE_WINDOW` | 4 | Messages decoded concurrently; results still reach the tables in delivery order |
+| `BIZON_RS_APPEND_DEPTH` | 4 | AppendRows requests in flight per table |
 | `BIZON_RS_ENSURE_TABLES` | true | Create and extend tables before appending |
 | `BIZON_RS_BQ_WRITE_ENDPOINT` / `BIZON_RS_BQ_REST_ENDPOINT` | Google | Overrides, e.g. `http://127.0.0.1:50051` for `fake-bqwrite` |
 
