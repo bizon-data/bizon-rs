@@ -1,13 +1,14 @@
 //! `bizon-stream run`: consume → decode → transform → encode → append → commit acknowledged offsets.
 //!
-//! Decoding runs inline on the consumer task, which keeps per-partition order for free; appends run
-//! concurrently per table. In-flight rows are bounded by bytes, and offsets are committed only past
-//! rows BigQuery has acknowledged (at-least-once, like bizon).
+//! The consumer task reads, tracks and dispatches messages in delivery order; decoding runs on a
+//! bounded window of blocking tasks, and results reach the tables oldest first, so the effect is the
+//! same as decoding inline. Appends run concurrently per table. In-flight rows are bounded by bytes,
+//! and offsets are committed only past rows BigQuery has acknowledged (at-least-once, like bizon).
 
 pub mod offsets;
 pub mod table;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,7 +30,7 @@ use crate::kafka::client::client_config;
 use crate::kafka::message::{MessageParser, RawMessage};
 use crate::kafka::registry::{Registry, RegistrySchema};
 use crate::metrics::Metrics;
-use crate::pipeline::{Outcome, Pipeline};
+use crate::pipeline::{Outcome, Pipeline, PipelineError};
 use crate::proto::descriptor::TableDescriptor;
 
 /// Knobs that are not part of bizon's config.yml, read from `BIZON_RS_*` so the mounted config stays
@@ -47,6 +48,11 @@ pub struct RunOptions {
     pub commit: bool,
     pub hostname: Option<String>,
     pub drain_timeout: Duration,
+    /// Messages decoded concurrently. A single hot partition is otherwise bound to one core.
+    pub decode_window: usize,
+    /// AppendRows requests in flight per table connection. With slow acks this, not decoding, caps
+    /// a table's throughput.
+    pub append_depth: usize,
 }
 
 impl RunOptions {
@@ -64,6 +70,8 @@ impl RunOptions {
             commit: var("ENVIRONMENT").as_deref() == Some("production"),
             hostname: var("HOSTNAME"),
             drain_timeout: Duration::from_secs(num("BIZON_RS_DRAIN_SECS", 20)),
+            decode_window: num("BIZON_RS_DECODE_WINDOW", 4).max(1) as usize,
+            append_depth: num("BIZON_RS_APPEND_DEPTH", 4).max(1) as usize,
         }
     }
 }
@@ -220,7 +228,10 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
         fatal: fatal_tx,
         max_rows: cfg.destination.bq_max_rows_per_request,
         linger: opts.linger,
-        writer: WriterOptions::default(),
+        writer: WriterOptions {
+            max_inflight: opts.append_depth,
+            ..WriterOptions::default()
+        },
         location: cfg.destination.dataset_location.clone(),
         partitioning: cfg.destination.time_partitioning.clone(),
     });
@@ -243,15 +254,19 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
         });
     }
 
-    let descriptors: HashMap<String, TableDescriptor> = cfg
-        .destination
-        .record_schemas
-        .iter()
-        .map(|s| Ok((s.destination_id.clone(), TableDescriptor::new(&s.columns())?)))
-        .collect::<anyhow::Result<_>>()?;
-    let parser = MessageParser::new(&cfg.source);
-    let lookup = |id: &str| descriptors.get(id);
-    let pipeline = Pipeline::new(&parser, &cfg.transform, &lookup);
+    // `run` lives as long as the process, so the decode inputs are leaked to be shared with the
+    // blocking decode tasks.
+    let descriptors: &'static HashMap<String, TableDescriptor> = Box::leak(Box::new(
+        cfg.destination
+            .record_schemas
+            .iter()
+            .map(|s| Ok((s.destination_id.clone(), TableDescriptor::new(&s.columns())?)))
+            .collect::<anyhow::Result<_>>()?,
+    ));
+    let parser: &'static MessageParser = Box::leak(Box::new(MessageParser::new(&cfg.source)));
+    let lookup: &'static (dyn Fn(&str) -> Option<&'static TableDescriptor> + Sync) = Box::leak(Box::new(|id: &str| descriptors.get(id)));
+    let pipeline: &'static Pipeline<'static> =
+        Box::leak(Box::new(Pipeline::new(parser, Box::leak(Box::new(cfg.transform.clone())), lookup)));
     let auth = &cfg.source.authentication;
     let registry = Registry::new(
         &auth.schema_registry_url,
@@ -263,42 +278,82 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
     let budget_total = (opts.inflight_bytes / 1024) as u32;
     let mut tables: HashMap<Arc<str>, TableHandle> = HashMap::new();
 
+    let window = opts.decode_window;
+    let mut pending: VecDeque<Decoding> = VecDeque::with_capacity(window);
     let outcome: anyhow::Result<()> = loop {
-        let msg = tokio::select! {
+        let event = tokio::select! {
             biased;
             _ = sigterm.recv() => break Ok(()),
             _ = tokio::signal::ctrl_c() => break Ok(()),
             Some(e) = fatal_rx.recv() => break Err(e),
-            m = consumer.recv() => m,
+            done = async { (&mut pending.front_mut().expect("guarded by the branch condition").task).await }, if !pending.is_empty() => Event::Decoded(done),
+            m = consumer.recv(), if pending.len() < window => Event::Message(m),
         };
-        let m = match msg {
-            Ok(m) => m,
-            Err(e) => break Err(anyhow::Error::from(e).context("consuming")),
+        let m = match event {
+            Event::Decoded(done) => {
+                let Decoding { ticket, at, .. } = pending.pop_front().expect("the front was just awaited");
+                let (destination_id, large, data) = match done {
+                    Ok(Ok(Outcome::Skipped)) => {
+                        Metrics::add(&metrics.skipped, 1);
+                        tracker.lock().unwrap().done(&ticket);
+                        continue;
+                    }
+                    Ok(Ok(Outcome::Row { destination_id, bytes })) => (destination_id, false, bytes),
+                    Ok(Ok(Outcome::Large { destination_id, ndjson })) => (destination_id, true, ndjson),
+                    Ok(Err(e)) => break Err(anyhow::anyhow!("{at}: {e}")),
+                    Err(e) => break Err(anyhow::anyhow!("{at}: decode task failed: {e}")),
+                };
+                let permits = ((data.len() / 1024) as u32).clamp(1, budget_total);
+                let permit = budget.clone().acquire_many_owned(permits).await.expect("semaphore is never closed");
+                metrics
+                    .inflight_bytes
+                    .store((opts.inflight_bytes - budget.available_permits() * 1024) as u64, Ordering::Relaxed);
+                let handle = tables.entry(destination_id.clone()).or_insert_with(|| {
+                    let schema = cfg.record_schema(&destination_id).expect("validated at startup").clone();
+                    let desc = &descriptors[&*destination_id];
+                    let table = TableRef::parse(&destination_id).expect("destination_id is project.dataset.table");
+                    let h = table::spawn(shared.clone(), table, schema, desc);
+                    flushes.lock().unwrap().push(h.flush.clone());
+                    h
+                });
+                let msg = match large {
+                    false => TableMsg::Row {
+                        bytes: Bytes::from(data),
+                        ticket,
+                        permit,
+                    },
+                    true => TableMsg::Large {
+                        ndjson: data,
+                        ticket,
+                        permit,
+                    },
+                };
+                if handle.tx.send(msg).await.is_err() {
+                    break Err(fatal_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| anyhow::anyhow!("table task for {destination_id} stopped")));
+                }
+                continue;
+            }
+            Event::Message(Ok(m)) => m,
+            Event::Message(Err(e)) => break Err(anyhow::Error::from(e).context("consuming")),
         };
         Metrics::add(&metrics.messages, 1);
-        let header_vec: Vec<(&str, Option<&[u8]>)> = m
-            .headers()
-            .map(|h| h.iter().map(|h| (h.key, h.value)).collect())
-            .unwrap_or_default();
-        let raw = RawMessage {
-            topic: m.topic(),
-            partition: m.partition(),
-            offset: m.offset(),
-            timestamp_ms: m.timestamp().to_millis().unwrap_or(-1),
-            key: m.key(),
-            value: m.payload(),
-            headers: m.headers().map(|_| header_vec.as_slice()),
-        };
-        if let Some(id) = parser.schema_id(&raw) {
-            if let std::collections::hash_map::Entry::Vacant(slot) = schemas.entry(id) {
-                match registry.get(id).await {
+        let header_vec = headers(&m);
+        let raw = raw_message(&m, &header_vec);
+        let schema = match parser.schema_id(&raw) {
+            Some(id) => match schemas.get(&id) {
+                Some(s) => Some((id, s.clone())),
+                None => match registry.get(id).await {
                     Ok(s) => {
-                        slot.insert(s);
+                        schemas.insert(id, s.clone());
+                        Some((id, s))
                     }
                     Err(e) => break Err(anyhow::Error::from(e).context("schema registry")),
-                }
-            }
-        }
+                },
+            },
+            None => None,
+        };
         let Some(topic) = topics.get(raw.topic) else {
             break Err(anyhow::anyhow!("message from unsubscribed topic {}", raw.topic));
         };
@@ -311,56 +366,29 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
             continue;
         };
         let at = format!("{}[{}]@{}", raw.topic, raw.partition, raw.offset);
-        let inserted_at = crate::timefmt::now_isoformat();
-        let (destination_id, large, data) = match pipeline.process(&raw, |id| schemas.get(&id).cloned(), &inserted_at) {
-            Ok(Outcome::Skipped) => {
-                Metrics::add(&metrics.skipped, 1);
-                tracker.lock().unwrap().done(&ticket);
-                continue;
-            }
-            Ok(Outcome::Row { destination_id, bytes }) => (destination_id, false, bytes),
-            Ok(Outcome::Large { destination_id, ndjson }) => (destination_id, true, ndjson),
-            Err(e) => break Err(anyhow::anyhow!("{at}: {e}")),
-        };
-        let permits = ((data.len() / 1024) as u32).clamp(1, budget_total);
-        let permit = budget.clone().acquire_many_owned(permits).await.expect("semaphore is never closed");
-        metrics
-            .inflight_bytes
-            .store((opts.inflight_bytes - budget.available_permits() * 1024) as u64, Ordering::Relaxed);
-        let handle = tables.entry(destination_id.clone()).or_insert_with(|| {
-            let schema = cfg.record_schema(&destination_id).expect("validated at startup").clone();
-            let desc = &descriptors[&*destination_id];
-            let table = TableRef::parse(&destination_id).expect("destination_id is project.dataset.table");
-            let h = table::spawn(shared.clone(), table, schema, desc);
-            flushes.lock().unwrap().push(h.flush.clone());
-            h
+        let owned = m.detach();
+        let task = tokio::task::spawn_blocking(move || {
+            let header_vec = headers(&owned);
+            let raw = raw_message(&owned, &header_vec);
+            let inserted_at = crate::timefmt::now_isoformat();
+            pipeline.process(
+                &raw,
+                |id| schema.as_ref().filter(|(sid, _)| *sid == id).map(|(_, s)| s.clone()),
+                &inserted_at,
+            )
         });
-        let msg = match large {
-            false => TableMsg::Row {
-                bytes: Bytes::from(data),
-                ticket,
-                permit,
-            },
-            true => TableMsg::Large {
-                ndjson: data,
-                ticket,
-                permit,
-            },
-        };
-        if handle.tx.send(msg).await.is_err() {
-            break Err(fatal_rx
-                .try_recv()
-                .unwrap_or_else(|_| anyhow::anyhow!("table task for {destination_id} stopped")));
-        }
+        pending.push_back(Decoding { ticket, at, task });
     };
 
+    // Decodes still pending were never sent; their offsets stay uncommitted and are re-read.
+    let abandoned = pending.len();
     // After an error the failed message never completes, so don't wait the full timeout for it.
     let timeout = if outcome.is_ok() {
         opts.drain_timeout
     } else {
         opts.drain_timeout.min(Duration::from_secs(5))
     };
-    drain(&tables, &tracker, timeout).await;
+    drain(&tables, &tracker, timeout, abandoned).await;
     if opts.commit {
         let commits = tracker.lock().unwrap().take_commits(None);
         if !commits.is_empty() {
@@ -373,13 +401,43 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
     outcome
 }
 
-/// Flushes every table and waits (bounded) for in-flight rows to be acknowledged.
-async fn drain(tables: &HashMap<Arc<str>, TableHandle>, tracker: &Mutex<Tracker>, timeout: Duration) {
+/// Flushes every table and waits (bounded) for in-flight rows to be acknowledged. `abandoned` tracked
+/// messages were never sent and will not complete.
+async fn drain(tables: &HashMap<Arc<str>, TableHandle>, tracker: &Mutex<Tracker>, timeout: Duration, abandoned: usize) {
     for h in tables.values() {
         h.flush.notify_one();
     }
     let started = Instant::now();
-    while tracker.lock().unwrap().in_flight(None) > 0 && started.elapsed() < timeout {
+    while tracker.lock().unwrap().in_flight(None) > abandoned && started.elapsed() < timeout {
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct Decoding {
+    ticket: offsets::Ticket,
+    at: String,
+    task: tokio::task::JoinHandle<Result<Outcome, PipelineError>>,
+}
+
+enum Event<M> {
+    Decoded(Result<Result<Outcome, PipelineError>, tokio::task::JoinError>),
+    Message(KafkaResult<M>),
+}
+
+fn headers<M: Message>(m: &M) -> Vec<(&str, Option<&[u8]>)> {
+    m.headers()
+        .map(|h| h.iter().map(|h| (h.key, h.value)).collect())
+        .unwrap_or_default()
+}
+
+fn raw_message<'a, M: Message>(m: &'a M, headers: &'a [(&'a str, Option<&'a [u8]>)]) -> RawMessage<'a> {
+    RawMessage {
+        topic: m.topic(),
+        partition: m.partition(),
+        offset: m.offset(),
+        timestamp_ms: m.timestamp().to_millis().unwrap_or(-1),
+        key: m.key(),
+        value: m.payload(),
+        headers: m.headers().map(|_| headers),
     }
 }
