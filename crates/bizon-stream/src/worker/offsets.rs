@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Tp {
@@ -21,8 +22,9 @@ pub struct Ticket {
 #[derive(Debug)]
 struct Partition {
     generation: u64,
-    /// Consumed, not yet committable offsets in consume order, with their done flag.
-    pending: VecDeque<(i64, bool)>,
+    /// Consumed, not yet committable offsets in consume order, with their done flag and when they
+    /// were consumed.
+    pending: VecDeque<(i64, bool, Instant)>,
     /// Next offset to commit (last contiguous done + 1), and the last one committed.
     committable: Option<i64>,
     committed: Option<i64>,
@@ -57,7 +59,7 @@ impl Tracker {
     /// Registers a consumed offset; `None` if the partition is not assigned (it was just revoked).
     pub fn track(&mut self, tp: &Tp, offset: i64) -> Option<Ticket> {
         let p = self.parts.get_mut(tp)?;
-        p.pending.push_back((offset, false));
+        p.pending.push_back((offset, false, Instant::now()));
         Some(Ticket {
             tp: tp.clone(),
             generation: p.generation,
@@ -69,10 +71,10 @@ impl Tracker {
         let Some(p) = self.parts.get_mut(&t.tp).filter(|p| p.generation == t.generation) else {
             return;
         };
-        if let Ok(i) = p.pending.binary_search_by_key(&t.offset, |(o, _)| *o) {
+        if let Ok(i) = p.pending.binary_search_by_key(&t.offset, |(o, _, _)| *o) {
             p.pending[i].1 = true;
         }
-        while let Some(&(o, true)) = p.pending.front() {
+        while let Some(&(o, true, _)) = p.pending.front() {
             p.pending.pop_front();
             p.committable = Some(o + 1);
         }
@@ -92,6 +94,45 @@ impl Tracker {
         }
         out.sort();
         out
+    }
+
+    /// When the oldest consumed, not yet acknowledged message was consumed. A partition's front entry
+    /// is never done (done fronts are popped), so it is that partition's oldest.
+    pub fn oldest_pending(&self) -> Option<Instant> {
+        self.parts.values().filter_map(|p| p.pending.front().map(|e| e.2)).min()
+    }
+
+    /// Offsets to commit again for partitions with nothing in flight, so the broker never expires them:
+    /// a quiet partition is otherwise committed once and re-read from `auto.offset.reset` once its
+    /// commit ages out while no member of the group subscribes to its topic. Partitions this worker
+    /// has not committed yet are listed separately; their broker offset must be read first.
+    pub fn idle_commits(&self) -> (Vec<(Tp, i64)>, Vec<Tp>) {
+        let (mut known, mut unknown) = (Vec::new(), Vec::new());
+        for (tp, p) in &self.parts {
+            if !p.pending.is_empty() || p.committable != p.committed {
+                continue;
+            }
+            match p.committed {
+                Some(c) => known.push((tp.clone(), c)),
+                None => unknown.push(tp.clone()),
+            }
+        }
+        known.sort();
+        unknown.sort();
+        (known, unknown)
+    }
+
+    /// Takes the broker's committed offset for a partition this worker has neither consumed from nor
+    /// committed since assignment. Returns false if that is no longer true.
+    pub fn adopt_committed(&mut self, tp: &Tp, offset: i64) -> bool {
+        match self.parts.get_mut(tp) {
+            Some(p) if p.pending.is_empty() && p.committable.is_none() && p.committed.is_none() => {
+                p.committable = Some(offset);
+                p.committed = Some(offset);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Consumed offsets not yet acknowledged, for the given partitions (all when `None`).
@@ -123,13 +164,16 @@ mod tests {
         t.done(&a[1]);
         t.done(&a[2]);
         assert!(t.take_commits(None).is_empty(), "offset 10 is still pending");
+        let oldest = t.oldest_pending().unwrap();
         t.done(&a[0]);
+        assert!(t.oldest_pending().unwrap() >= oldest, "the oldest moved to offset 13");
         assert_eq!(t.take_commits(None), vec![(tp(0), 13)]);
         assert!(t.take_commits(None).is_empty(), "nothing new");
         t.done(&a[4]);
         t.done(&a[3]);
         assert_eq!(t.take_commits(None), vec![(tp(0), 15)]);
         assert_eq!(t.in_flight(None), 0);
+        assert_eq!(t.oldest_pending(), None);
     }
 
     #[test]
@@ -145,6 +189,29 @@ mod tests {
         assert_eq!(t.in_flight(None), 1, "the stale ack did not complete the new generation's offset");
         t.done(&new);
         assert_eq!(t.take_commits(None), vec![(tp(0), 6)]);
+    }
+
+    #[test]
+    fn idle_partitions_are_recommitted_busy_ones_are_not() {
+        let mut t = Tracker::default();
+        for p in 0..4 {
+            t.assign(tp(p));
+        }
+        let a = t.track(&tp(0), 10).unwrap();
+        t.done(&a);
+        assert_eq!(t.take_commits(None), vec![(tp(0), 11)]);
+        t.track(&tp(1), 5).unwrap();
+        let c = t.track(&tp(2), 7).unwrap();
+        t.done(&c);
+        // tp0: committed and idle; tp1: in flight; tp2: acked but not committed yet; tp3: never consumed.
+        assert_eq!(t.idle_commits(), (vec![(tp(0), 11)], vec![tp(3)]));
+
+        assert!(t.adopt_committed(&tp(3), 42));
+        assert!(!t.adopt_committed(&tp(3), 50), "already known");
+        assert!(!t.adopt_committed(&tp(1), 1), "has messages in flight");
+        assert!(t.take_commits(None).contains(&(tp(2), 8)));
+        assert_eq!(t.idle_commits(), (vec![(tp(0), 11), (tp(2), 8), (tp(3), 42)], vec![]));
+        assert!(t.take_commits(None).is_empty(), "adopted offsets are not new commits");
     }
 
     #[test]

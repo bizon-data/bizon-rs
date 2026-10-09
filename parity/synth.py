@@ -296,6 +296,37 @@ def cloudevents_case(repo: Path):
     write(repo / "fixtures/parity/cloudevents", cfg, messages, {})
 
 
+def json_names_case(repo: Path):
+    """Keys named after a column's protobuf JSON name (accountId for account_id).
+    ParseDict accepts JSON names, so bizon fills the column; nulls are dropped first and the later key wins."""
+    h = [("ce_type", "t"), ("ce_id", "1")]
+    keys = [
+        '{"accountId": 12}',
+        '{"account_id": 12, "accountId": 13}',
+        '{"accountId": 13, "account_id": 12}',
+        '{"accountId": "12"}',
+        '{"AccountId": 12}',
+        '{"accountID": 12}',
+        '{"CeType": "k", "account_id": 1}',
+        '{"account_id": 1, "kafkaTopic": "x"}',
+        '{"accountId": null}',
+        '{"account_id": 12, "accountId": null}',
+        '{"accountId": 12, "account_id": null}',
+        '{"accountId": 1.5}',
+        '{"account_id": 7}',
+        '{"accountId": 12, "extra": 1}',
+        '{"KafkaPartition": 5, "account_id": 1}',
+        '{"payload": "k", "account_id": 1}',
+        '"{\\"accountId\\": 17}"',
+        '{"bogus": null, "account_id": 1}',
+        '{"account_id": 1, "accountId": 2, "payload": "k"}',
+    ]
+    messages = [msg("jn.a", i, key, '{"a": 1}', h) for i, key in enumerate(keys)]
+    cfg = config("synth-json-names", "utf-8", [("jn.a", "p.d.jn")], [col("account_id", "INTEGER", "REQUIRED")],
+                 CLOUDEVENTS_COLUMNS, {"label": "parse_events", "python": template("cloudevents")})
+    write(repo / "fixtures/parity/json_names", cfg, messages, {})
+
+
 def json_events_case(repo: Path):
     k = lambda i, **extra: json.dumps({"account_id": i, "id": f"k{i}", **extra})
     cases = [
@@ -547,3 +578,4 @@ if __name__ == "__main__":
     cloudevents_enriched_case(a.repo)
     avro_events_case(a.repo)
     decimal_case(a.repo)
+    json_names_case(a.repo)

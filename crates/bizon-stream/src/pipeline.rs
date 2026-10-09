@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use serde_json::Value;
 
 use crate::avro::AvroError;
-use crate::kafka::message::{MessageParser, ParseError, Parsed, Payload, RawMessage};
+use crate::kafka::message::{MessageParser, ParseError, Parsed, Payload, RawMessage, SkipReason};
 use crate::kafka::registry::RegistrySchema;
 use crate::proto::descriptor::TableDescriptor;
 use crate::proto::encode::{encode_row, EncodeError, Value as Cell};
@@ -18,7 +18,7 @@ pub const MAX_STREAM_ROW_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum Outcome {
-    Skipped,
+    Skipped(SkipReason),
     Row {
         destination_id: Arc<str>,
         bytes: Vec<u8>,
@@ -110,7 +110,7 @@ impl<'a> Pipeline<'a> {
         inserted_at: &str,
     ) -> Result<Outcome, PipelineError> {
         let rec = match self.parser.parse(msg, schemas)? {
-            Parsed::Skipped(_) => return Ok(Outcome::Skipped),
+            Parsed::Skipped(reason) => return Ok(Outcome::Skipped(reason)),
             Parsed::Record(r) => r,
         };
         let (value, schema_column) = match &rec.value {

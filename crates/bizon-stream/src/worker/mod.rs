@@ -26,7 +26,7 @@ use self::table::{Shared, TableHandle, TableMsg};
 use crate::bq::rest::BigQueryRest;
 use crate::bq::write::{TableRef, WriteClient, WriterOptions};
 use crate::config::Config;
-use crate::kafka::client::client_config;
+use crate::kafka::client::{client_config, consumer_lag_by_topic};
 use crate::kafka::message::{MessageParser, RawMessage};
 use crate::kafka::registry::{Registry, RegistrySchema};
 use crate::metrics::Metrics;
@@ -53,6 +53,11 @@ pub struct RunOptions {
     /// AppendRows requests in flight per table connection. With slow acks this, not decoding, caps
     /// a table's throughput.
     pub append_depth: usize,
+    /// /healthz fails once a consumed message has waited this long for its ack. Longer than the
+    /// 5-minute append retry budget, after which the worker exits on its own.
+    pub stall: Duration,
+    /// How often idle partitions' offsets are committed again; zero disables it.
+    pub recommit: Duration,
 }
 
 impl RunOptions {
@@ -72,6 +77,8 @@ impl RunOptions {
             drain_timeout: Duration::from_secs(num("BIZON_RS_DRAIN_SECS", 20)),
             decode_window: num("BIZON_RS_DECODE_WINDOW", 4).max(1) as usize,
             append_depth: num("BIZON_RS_APPEND_DEPTH", 4).max(1) as usize,
+            stall: Duration::from_secs(num("BIZON_RS_STALL_SECS", 600)),
+            recommit: Duration::from_secs(num("BIZON_RS_RECOMMIT_SECS", 6 * 3600)),
         }
     }
 }
@@ -107,6 +114,59 @@ fn commit_list(commits: &[(Tp, i64)]) -> TopicPartitionList {
     tpl
 }
 
+fn commit_async(consumer: &StreamConsumer<Ctx>, metrics: &Metrics, commits: &[(Tp, i64)]) -> bool {
+    match consumer.commit(&commit_list(commits), CommitMode::Async) {
+        Ok(()) => true,
+        Err(e) if benign_commit_error(&e) => false,
+        Err(e) => {
+            Metrics::add(&metrics.commit_failures, 1);
+            tracing::warn!(error = %e, "commit failed");
+            false
+        }
+    }
+}
+
+/// Commits idle partitions' offsets again so the broker keeps them (see `Tracker::idle_commits`).
+/// Partitions not committed by this worker yet take the broker's offset first.
+async fn recommit_idle(
+    consumer: &Arc<StreamConsumer<Ctx>>,
+    tracker: &Mutex<Tracker>,
+    metrics: &Metrics,
+    topics: &HashMap<String, Arc<str>>,
+) {
+    let unknown = tracker.lock().unwrap().idle_commits().1;
+    if !unknown.is_empty() {
+        let mut tpl = TopicPartitionList::new();
+        for tp in &unknown {
+            tpl.add_partition(&tp.topic, tp.partition);
+        }
+        let c = consumer.clone();
+        match tokio::task::spawn_blocking(move || c.committed_offsets(tpl, Duration::from_secs(30))).await {
+            Ok(Ok(tpl)) => {
+                let mut t = tracker.lock().unwrap();
+                for e in tpl.elements() {
+                    if let (Offset::Offset(o), Some(topic)) = (e.offset(), topics.get(e.topic())) {
+                        t.adopt_committed(
+                            &Tp {
+                                topic: topic.clone(),
+                                partition: e.partition(),
+                            },
+                            o,
+                        );
+                    }
+                }
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "reading committed offsets failed"),
+            Err(e) => tracing::warn!(error = %e, "reading committed offsets failed"),
+        }
+    }
+    let tracker = tracker.lock().unwrap();
+    let (idle, _) = tracker.idle_commits();
+    if !idle.is_empty() && commit_async(consumer, metrics, &idle) {
+        Metrics::add(&metrics.recommits, idle.len() as u64);
+    }
+}
+
 /// Commit errors that only mean "you are no longer the owner": the next owner re-reads.
 fn benign_commit_error(e: &KafkaError) -> bool {
     matches!(
@@ -123,6 +183,12 @@ fn benign_commit_error(e: &KafkaError) -> bool {
 impl ClientContext for Ctx {
     fn error(&self, error: KafkaError, reason: &str) {
         tracing::warn!(%error, reason, "kafka client error");
+    }
+
+    fn stats_raw(&self, statistics: &[u8]) {
+        if let Some(lag) = consumer_lag_by_topic(statistics) {
+            self.metrics.set_consumer_lag(lag);
+        }
     }
 }
 
@@ -144,12 +210,16 @@ impl ConsumerContext for Ctx {
         if self.commit && !commits.is_empty() {
             match consumer.commit(&commit_list(&commits), CommitMode::Sync) {
                 Ok(()) => Metrics::add(&self.metrics.commits, 1),
-                Err(e) => tracing::warn!(error = %e, "commit on revoke failed"),
+                Err(e) => {
+                    Metrics::add(&self.metrics.commit_failures, 1);
+                    tracing::warn!(error = %e, "commit on revoke failed")
+                }
             }
         }
         for tp in &tps {
             tracker.revoke(tp);
         }
+        Metrics::add(&self.metrics.partitions_revoked, tps.len() as u64);
         self.metrics
             .assigned_partitions
             .store(tracker.assigned().count() as u64, Ordering::Relaxed);
@@ -167,6 +237,7 @@ impl ConsumerContext for Ctx {
             for tp in &tps {
                 tracker.assign(tp.clone());
             }
+            Metrics::add(&self.metrics.partitions_assigned, tps.len() as u64);
             self.metrics
                 .assigned_partitions
                 .store(tracker.assigned().count() as u64, Ordering::Relaxed);
@@ -178,6 +249,7 @@ impl ConsumerContext for Ctx {
     fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
         if let Err(e) = result {
             if !benign_commit_error(&e) {
+                Metrics::add(&self.metrics.commit_failures, 1);
                 tracing::warn!(error = %e, "async commit failed");
             }
         }
@@ -189,10 +261,24 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let metrics = Arc::new(Metrics::default());
     let ready = Arc::new(AtomicBool::new(false));
-    crate::health::serve(opts.health_port, ready.clone(), metrics.clone()).await?;
-    metrics.clone().spawn_statsd(cfg.name.clone());
+    crate::health::serve(opts.health_port, ready.clone(), metrics.clone(), opts.stall).await?;
+    metrics
+        .clone()
+        .spawn_statsd(statsd_tags(&cfg, opts.hostname.as_deref()), pipeline_tags(&cfg));
 
     let tracker = Arc::new(Mutex::new(Tracker::default()));
+    {
+        let (tracker, metrics) = (tracker.clone(), metrics.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let oldest = tracker.lock().unwrap().oldest_pending();
+                let age = oldest.map_or(0, |t| t.elapsed().as_secs());
+                metrics.oldest_unacked_secs.store(age, Ordering::Relaxed);
+            }
+        });
+    }
     let flushes = Arc::new(Mutex::new(Vec::new()));
     let topics: HashMap<String, Arc<str>> = cfg
         .source
@@ -210,6 +296,9 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
     };
     let mut cc = client_config(&cfg.source, opts.hostname.as_deref());
     cc.set("queued.max.messages.kbytes", opts.queue_kbytes.to_string());
+    if cc.get("statistics.interval.ms").is_none() {
+        cc.set("statistics.interval.ms", "10000");
+    }
     let consumer: Arc<StreamConsumer<Ctx>> = Arc::new(cc.create_with_context(ctx).context("creating Kafka consumer")?);
     let names: Vec<&str> = cfg.source.topics.iter().map(|t| t.name.as_str()).collect();
     consumer.subscribe(&names)?;
@@ -217,7 +306,9 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
 
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
-        write: WriteClient::connect(opts.write_endpoint.as_deref(), None).await?,
+        write: WriteClient::connect(opts.write_endpoint.as_deref(), None)
+            .await?
+            .with_metrics(metrics.clone()),
         rest: if opts.ensure_tables {
             Some(BigQueryRest::new(opts.rest_endpoint.as_deref()).await?)
         } else {
@@ -237,18 +328,22 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
     });
 
     if opts.commit {
-        let (consumer, tracker, metrics) = (consumer.clone(), tracker.clone(), metrics.clone());
+        let (consumer, tracker, metrics, topics) = (consumer.clone(), tracker.clone(), metrics.clone(), topics.clone());
+        let recommit = opts.recommit;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
+            let mut last_recommit = Instant::now();
             loop {
                 tick.tick().await;
-                let commits = tracker.lock().unwrap().take_commits(None);
-                if !commits.is_empty() {
-                    match consumer.commit(&commit_list(&commits), CommitMode::Async) {
-                        Ok(()) => Metrics::add(&metrics.commits, 1),
-                        Err(e) if benign_commit_error(&e) => {}
-                        Err(e) => tracing::warn!(error = %e, "commit failed"),
-                    }
+                if !recommit.is_zero() && last_recommit.elapsed() >= recommit {
+                    last_recommit = Instant::now();
+                    recommit_idle(&consumer, &tracker, &metrics, &topics).await;
+                }
+                // Committing under the tracker lock keeps these commits in order with the ones made on revoke.
+                let mut tracker = tracker.lock().unwrap();
+                let commits = tracker.take_commits(None);
+                if !commits.is_empty() && commit_async(&consumer, &metrics, &commits) {
+                    Metrics::add(&metrics.commits, 1);
                 }
             }
         });
@@ -293,8 +388,8 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
             Event::Decoded(done) => {
                 let Decoding { ticket, at, .. } = pending.pop_front().expect("the front was just awaited");
                 let (destination_id, large, data) = match done {
-                    Ok(Ok(Outcome::Skipped)) => {
-                        Metrics::add(&metrics.skipped, 1);
+                    Ok(Ok(Outcome::Skipped(reason))) => {
+                        metrics.skipped(reason);
                         tracker.lock().unwrap().done(&ticket);
                         continue;
                     }
@@ -312,7 +407,7 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
                     let schema = cfg.record_schema(&destination_id).expect("validated at startup").clone();
                     let desc = &descriptors[&*destination_id];
                     let table = TableRef::parse(&destination_id).expect("destination_id is project.dataset.table");
-                    let h = table::spawn(shared.clone(), table, schema, desc);
+                    let h = table::spawn(shared.clone(), destination_id.clone(), table, schema, desc);
                     flushes.lock().unwrap().push(h.flush.clone());
                     h
                 });
@@ -393,12 +488,44 @@ pub async fn run(cfg: Config, opts: RunOptions) -> anyhow::Result<()> {
         let commits = tracker.lock().unwrap().take_commits(None);
         if !commits.is_empty() {
             if let Err(e) = consumer.commit(&commit_list(&commits), CommitMode::Sync) {
+                Metrics::add(&metrics.commit_failures, 1);
                 tracing::warn!(error = %e, "final commit failed");
             }
         }
     }
     tracing::info!(ok = outcome.is_ok(), "stopped");
     outcome
+}
+
+/// Without these, the pods of one pipeline (one per Kafka cluster when a pipeline spans several) report
+/// under the same tags and overwrite each other's gauges.
+fn statsd_tags(cfg: &Config, hostname: Option<&str>) -> String {
+    let mut tags = vec![
+        format!("pipeline:{}", cfg.name),
+        format!("kafka_cluster:{}", cfg.transform.cluster()),
+        format!("version:{}", env!("CARGO_PKG_VERSION")),
+    ];
+    if let Some(h) = hostname {
+        tags.push(format!("pod_name:{h}"));
+    }
+    tags.join(",")
+}
+
+/// bizon's own tag keys, so dashboards on `bizon_pipeline.*` cover both runtimes. `kafka_cluster` tells
+/// the Rust series apart; `pod_name` is left out because counters from co-located pods sum correctly at the
+/// agent, and tables x pods would multiply the series count.
+fn pipeline_tags(cfg: &Config) -> String {
+    let mut tags = vec![format!("pipeline_name:{}", cfg.name)];
+    if let Some(stream) = &cfg.source.stream {
+        tags.push(format!("pipeline_stream:{stream}"));
+    }
+    tags.extend([
+        format!("pipeline_source:{}", cfg.source.name),
+        "pipeline_destination:bigquery_streaming_v2".to_string(),
+        format!("kafka_cluster:{}", cfg.transform.cluster()),
+        format!("version:{}", env!("CARGO_PKG_VERSION")),
+    ]);
+    tags.join(",")
 }
 
 /// Flushes every table and waits (bounded) for in-flight rows to be acknowledged. `abandoned` tracked
@@ -439,5 +566,22 @@ fn raw_message<'a, M: Message>(m: &'a M, headers: &'a [(&'a str, Option<&'a [u8]
         key: m.key(),
         value: m.payload(),
         headers: m.headers().map(|_| headers),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_tags_use_bizon_keys() {
+        let cfg = crate::config::tests::load("avro-cdc").unwrap();
+        let tags = pipeline_tags(&cfg);
+        assert!(
+            tags.starts_with(
+                "pipeline_name:avro-cdc,pipeline_stream:topic,pipeline_source:kafka,pipeline_destination:bigquery_streaming_v2,kafka_cluster:"
+            ),
+            "{tags}"
+        );
     }
 }

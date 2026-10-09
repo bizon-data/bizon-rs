@@ -21,6 +21,8 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Code, Status, Streaming};
 
+use crate::metrics::Metrics;
+
 const DEFAULT_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
@@ -65,6 +67,7 @@ pub struct WriteClient {
     channel: Channel,
     auth: Option<Arc<dyn gcp_auth::TokenProvider>>,
     quota_project: Option<String>,
+    metrics: Arc<Metrics>,
 }
 
 impl WriteClient {
@@ -85,7 +88,12 @@ impl WriteClient {
             channel: ep.connect_lazy(),
             auth,
             quota_project,
+            metrics: Arc::default(),
         })
+    }
+
+    pub fn with_metrics(self, metrics: Arc<Metrics>) -> Self {
+        Self { metrics, ..self }
     }
 
     pub fn table_writer(&self, table: &TableRef, schema: ProtoSchema, opts: WriterOptions) -> TableWriter {
@@ -351,6 +359,7 @@ impl WriterTask {
             };
             let backoff = self.opts.backoff_initial.saturating_mul(1 << attempts.saturating_sub(1).min(16));
             tracing::warn!(stream = %self.stream, %reason, attempts, ?backoff, pending = self.inflight.len(), "append retry");
+            Metrics::add(&self.client.metrics.append_retries, 1);
             tokio::time::sleep(backoff.min(self.opts.backoff_max)).await;
 
             let mut failed = None;

@@ -1,14 +1,17 @@
-//! /healthz (process alive), /readyz (partitions assigned) and /metrics on a plain TCP listener.
+//! /healthz (fails once the oldest unacknowledged message is older than `stall`), /readyz
+//! (partitions assigned) and /metrics on a plain TCP listener.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::metrics::Metrics;
 
-pub async fn serve(port: u16, ready: Arc<AtomicBool>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
+/// `stall` of zero disables the /healthz check.
+pub async fn serve(port: u16, ready: Arc<AtomicBool>, metrics: Arc<Metrics>, stall: Duration) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
@@ -19,6 +22,7 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, metrics: Arc<Metrics>) -> 
                 let line = String::from_utf8_lossy(&buf[..n]);
                 let path = line.split_whitespace().nth(1).unwrap_or("/");
                 let (status, body) = match path {
+                    "/healthz" if stalled(&metrics, stall) => ("503 Service Unavailable", "stalled\n".to_string()),
                     "/healthz" => ("200 OK", "ok\n".to_string()),
                     "/readyz" if ready.load(Ordering::Relaxed) => ("200 OK", "ready\n".to_string()),
                     "/readyz" => ("503 Service Unavailable", "not ready\n".to_string()),
@@ -34,4 +38,8 @@ pub async fn serve(port: u16, ready: Arc<AtomicBool>, metrics: Arc<Metrics>) -> 
         }
     });
     Ok(())
+}
+
+fn stalled(metrics: &Metrics, stall: Duration) -> bool {
+    !stall.is_zero() && metrics.oldest_unacked_secs.load(Ordering::Relaxed) >= stall.as_secs()
 }
