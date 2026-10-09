@@ -60,13 +60,14 @@ struct Batch {
     started: Option<Instant>,
 }
 
-pub fn spawn(shared: Arc<Shared>, table: TableRef, schema: RecordSchema, desc: &TableDescriptor) -> TableHandle {
+pub fn spawn(shared: Arc<Shared>, destination_id: Arc<str>, table: TableRef, schema: RecordSchema, desc: &TableDescriptor) -> TableHandle {
     let (tx, rx) = mpsc::channel(1024);
     let flush = Arc::new(Notify::new());
     let task = TableTask {
         overhead: desc.proto_schema_bytes().len(),
         writer: shared.write.table_writer(&table, desc.proto_schema.clone(), shared.writer.clone()),
         shared,
+        destination_id,
         table,
         schema,
         rx,
@@ -79,6 +80,7 @@ pub fn spawn(shared: Arc<Shared>, table: TableRef, schema: RecordSchema, desc: &
 
 struct TableTask {
     shared: Arc<Shared>,
+    destination_id: Arc<str>,
     table: TableRef,
     schema: RecordSchema,
     writer: crate::bq::write::TableWriter,
@@ -92,7 +94,10 @@ impl TableTask {
     async fn run(mut self) {
         if let Some(rest) = &self.shared.rest {
             match ensure_table(rest, &self.table, &self.schema, self.shared.partitioning.as_ref()).await {
-                Ok(Ensured::AddedColumns(_)) => self.writer.notify_schema_change(),
+                Ok(Ensured::AddedColumns(_)) => {
+                    Metrics::add(&self.shared.metrics.schema_changes, 1);
+                    self.writer.notify_schema_change()
+                }
                 Ok(_) => {}
                 Err(e) => {
                     let _ = self.shared.fatal.send(e.context(format!("ensuring table {}", self.table.table)));
@@ -150,12 +155,14 @@ impl TableTask {
             }
         };
         let shared = self.shared.clone();
+        let destination_id = self.destination_id.clone();
         let table = self.table.table.clone();
         let (tickets, permits) = (batch.tickets, batch.permits);
         tokio::spawn(async move {
             match ack.await {
                 Ok(Ok(())) => {
                     shared.metrics.observe_append(n, bytes, sent.elapsed());
+                    shared.metrics.synced(&destination_id, n, 0);
                     let mut t = shared.tracker.lock().unwrap();
                     for ticket in &tickets {
                         t.done(ticket);
@@ -174,6 +181,7 @@ impl TableTask {
 
     fn load(&self, mut ndjson: Vec<u8>, ticket: Ticket, permit: OwnedSemaphorePermit) {
         let shared = self.shared.clone();
+        let destination_id = self.destination_id.clone();
         let table = self.table.clone();
         tokio::spawn(async move {
             if let Some(rest) = &shared.rest {
@@ -190,6 +198,7 @@ impl TableTask {
                 }
             }
             Metrics::add(&shared.metrics.large_rows, 1);
+            shared.metrics.synced(&destination_id, 1, 1);
             shared.tracker.lock().unwrap().done(&ticket);
             drop(permit);
         });

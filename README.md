@@ -94,11 +94,16 @@ bizon's config come from `BIZON_RS_*` variables:
 | `BIZON_RS_DECODE_WINDOW` | 4 | Messages decoded concurrently; results still reach the tables in delivery order |
 | `BIZON_RS_APPEND_DEPTH` | 4 | AppendRows requests in flight per table |
 | `BIZON_RS_ENSURE_TABLES` | true | Create and extend tables before appending |
+| `BIZON_RS_STALL_SECS` | 600 | `/healthz` fails once a consumed message has waited this long for its BigQuery ack; 0 disables |
+| `BIZON_RS_RECOMMIT_SECS` | 21600 | Re-commit idle partitions' offsets this often, so the broker doesn't expire them (KIP-211); 0 disables |
 | `BIZON_RS_BQ_WRITE_ENDPOINT` / `BIZON_RS_BQ_REST_ENDPOINT` | Google | Overrides, e.g. `http://127.0.0.1:50051` for `fake-bqwrite` |
 
 Offsets are committed only when `ENVIRONMENT=production`, matching bizon. Google credentials come from the usual
 sources: the metadata server / Workload Identity, or a service-account key in `GOOGLE_APPLICATION_CREDENTIALS`.
-If `DD_AGENT_HOST` is set, counters are also sent to DogStatsD.
+If `DD_AGENT_HOST` is set, the `/metrics` series are also sent to DogStatsD every 10 s as `bizon_rs.*`, tagged
+`pipeline`, `kafka_cluster`, `version` and `pod_name`, with consumer lag per topic from librdkafka statistics.
+Rows written per table are also sent as bizon's own `bizon_pipeline.records_synced`, with bizon's tag keys,
+so existing dashboards cover both workers.
 
 ## Correctness: parity with bizon
 
@@ -124,7 +129,8 @@ cargo build --release -p bizon-stream -p fake-bqwrite && scripts/e2e-local.sh   
 
 `scripts/e2e-local.sh` runs a normal stream, a SIGTERM drain, a `kill -9` with restart, and a 1 → 2 → 1
 rebalance under load against a local Redpanda and `fake-bqwrite`. It asserts that no row is lost and that the
-group ends with zero lag.
+group ends with zero lag, then checks that `/healthz` fails when acks stop. `scripts/recommit-local.sh` checks
+that idle re-commits keep a quiet partition's offsets from expiring, against Apache Kafka.
 
 To regenerate fixtures and golden output, use bizon-core's environment:
 

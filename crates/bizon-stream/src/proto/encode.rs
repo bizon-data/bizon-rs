@@ -167,6 +167,31 @@ fn put_field(out: &mut Vec<u8>, number: u32, s: Scalar<'_>) {
     }
 }
 
+/// Python's steps for a row with a key that isn't a proto field name: the dict keeps each key at its
+/// first position with its last value, `None` values are dropped, and `ParseDict` assigns in dict
+/// order, accepting JSON names (`accountId` for `account_id`); of two keys naming one field, the later
+/// one wins.
+fn parse_dict_slots<'a>(desc: &TableDescriptor, row: Vec<(&'a str, Value<'a>)>) -> Result<Vec<Option<Value<'a>>>, EncodeError> {
+    let mut dict: Vec<(&'a str, Value<'a>)> = Vec::with_capacity(row.len());
+    for (name, value) in row {
+        match dict.iter_mut().find(|(n, _)| *n == name) {
+            Some(e) => e.1 = value,
+            None => dict.push((name, value)),
+        }
+    }
+    let mut slots = vec![None; desc.fields.len()];
+    for (name, value) in dict {
+        if value == Value::Null {
+            continue;
+        }
+        let idx = desc
+            .index_of_parse_dict(name)
+            .ok_or_else(|| EncodeError::UnknownField(name.to_string()))?;
+        slots[idx] = Some(value);
+    }
+    Ok(slots)
+}
+
 /// Encodes one row. Later duplicates of a column win, like a Python dict literal. `Null` values are
 /// dropped before encoding, as Python does.
 pub fn encode_row<'a>(
@@ -174,17 +199,25 @@ pub fn encode_row<'a>(
     row: impl IntoIterator<Item = (&'a str, Value<'a>)>,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let mut slots: Vec<Option<Value<'a>>> = vec![None; desc.fields.len()];
-    for (name, value) in row {
-        let idx = desc.index_of(name).ok_or_else(|| EncodeError::UnknownField(name.to_string()))?;
-        slots[idx] = (value != Value::Null).then_some(value);
-    }
+    let row: Vec<(&'a str, Value<'a>)> = row.into_iter().collect();
+    let proto_names = row.iter().all(|(name, _)| desc.index_of(name).is_some());
+    let slots = if proto_names {
+        let mut slots: Vec<Option<Value<'a>>> = vec![None; desc.fields.len()];
+        for (name, value) in row {
+            slots[desc.index_of(name).expect("checked above")] = (value != Value::Null).then_some(value);
+        }
+        slots
+    } else {
+        parse_dict_slots(desc, row)?
+    };
 
-    let fast = desc
-        .fields
-        .iter()
-        .zip(&slots)
-        .all(|(f, v)| v.as_ref().is_none_or(|v| !matches!(fast_path(f.wire, v), Coerced::Reject)));
+    // Any other key fails `TableRow(**row)`, so the whole row goes through `ParseDict`.
+    let fast = proto_names
+        && desc
+            .fields
+            .iter()
+            .zip(&slots)
+            .all(|(f, v)| v.as_ref().is_none_or(|v| !matches!(fast_path(f.wire, v), Coerced::Reject)));
 
     for (f, v) in desc.fields.iter().zip(&slots) {
         let Some(v) = v else {

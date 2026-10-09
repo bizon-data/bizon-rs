@@ -79,6 +79,11 @@ fn synthetic_decimal() {
 }
 
 #[test]
+fn synthetic_json_names() {
+    synthetic("json_names");
+}
+
+#[test]
 fn captured() {
     let (Ok(capture), Ok(config)) = (std::env::var("PARITY_CAPTURE"), std::env::var("PARITY_CONFIG")) else {
         eprintln!("PARITY_CAPTURE/PARITY_CONFIG not set; skipping");
@@ -138,7 +143,7 @@ fn assert_parity(capture: &std::path::Path, config: &std::path::Path) {
         let ours = pipeline.process(&raw, |id| schemas.get(&id).cloned(), FROZEN_AT);
         let at = format!("{}[{}]@{}", raw.topic, raw.partition, raw.offset);
         let verdict = match (g["outcome"].as_str().unwrap(), &ours) {
-            ("skipped", Ok(Outcome::Skipped)) => Ok(()),
+            ("skipped", Ok(Outcome::Skipped(_))) => Ok(()),
             ("row", Ok(Outcome::Row { destination_id, bytes })) => {
                 if g["destination_id"] != destination_id.as_ref() {
                     Err(format!("destination {} vs {}", g["destination_id"], destination_id))

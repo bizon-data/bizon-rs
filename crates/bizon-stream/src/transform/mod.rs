@@ -61,6 +61,18 @@ pub enum TransformSelectionError {
 }
 
 impl Builtin {
+    /// The `__cluster` literal: the Kafka cluster the pipeline reads.
+    pub fn cluster(&self) -> &str {
+        match self {
+            Builtin::Debezium { cluster, .. }
+            | Builtin::CloudEvents { cluster }
+            | Builtin::CloudEventsEnriched { cluster }
+            | Builtin::JsonEvents { cluster }
+            | Builtin::JsonCdc { cluster }
+            | Builtin::AvroEvents { cluster } => cluster,
+        }
+    }
+
     pub fn select(label: &str, python: &str) -> Result<Self, TransformSelectionError> {
         let malformed = |reason: &str| TransformSelectionError::Malformed {
             label: label.to_string(),

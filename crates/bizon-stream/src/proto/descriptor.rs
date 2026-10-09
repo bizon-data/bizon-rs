@@ -68,6 +68,8 @@ pub struct TableDescriptor {
     pub fields: Vec<FieldPlan>,
     pub proto_schema: ProtoSchema,
     index: HashMap<String, usize>,
+    /// protobuf's default JSON names (`account_id` -> `accountId`), which `ParseDict` also accepts.
+    json_index: HashMap<String, usize>,
 }
 
 impl TableDescriptor {
@@ -96,8 +98,10 @@ impl TableDescriptor {
             });
         }
         let index = fields.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
+        let json_index = fields.iter().enumerate().map(|(i, f)| (json_name(&f.name), i)).collect();
         Ok(Self {
             index,
+            json_index,
             fields,
             proto_schema: ProtoSchema {
                 proto_descriptor: Some(message),
@@ -109,9 +113,31 @@ impl TableDescriptor {
         self.index.get(name).copied()
     }
 
+    /// Field lookup as `ParseDict` does it: JSON name first, then proto name.
+    pub fn index_of_parse_dict(&self, name: &str) -> Option<usize> {
+        self.json_index.get(name).or_else(|| self.index.get(name)).copied()
+    }
+
     pub fn proto_schema_bytes(&self) -> Vec<u8> {
         self.proto_schema.encode_to_vec()
     }
+}
+
+/// protobuf's `ToJsonName`: underscores are dropped and the character after each is upper-cased.
+fn json_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for c in name.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -140,6 +166,14 @@ mod tests {
         .unwrap();
         let hex: String = d.proto_schema_bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, golden);
+    }
+
+    #[test]
+    fn json_names_follow_protobuf() {
+        assert_eq!(json_name("account_id"), "accountId");
+        assert_eq!(json_name("__ce_type"), "CeType");
+        assert_eq!(json_name("payload"), "payload");
+        assert_eq!(json_name("a__b_"), "aB");
     }
 
     #[test]

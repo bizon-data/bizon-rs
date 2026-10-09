@@ -31,7 +31,9 @@ serves one constraint: **a row written by bizon-rs must be byte-identical to the
    order, so acks, commits and error handling are unchanged.
 5. **Encode.** A hand-written proto2 encoder (`proto/encode.rs`) over a descriptor built like bizon's
    `proto_utils`. It reproduces both of bizon's paths: protobuf's constructor fast path, and the `ParseDict`
-   fallback that, for example, turns `"30"` into an INT64 30.
+   fallback that, for example, turns `"30"` into an INT64 30. Like `ParseDict`, the fallback also accepts a key
+   named by the column's protobuf JSON name (`accountId` for `account_id`); the later of two keys for one column
+   wins, and null values are dropped first.
 6. **Append.** One long-lived AppendRows connection per table on `_default`, with requests pipelined and acks
    matched in FIFO order. Retryable failures reconnect and resend un-acked requests. Per-row errors are fatal.
 7. **Commit.** `worker/offsets.rs` tracks, per partition, the contiguous prefix of offsets whose rows are
@@ -85,6 +87,11 @@ Python runtime. So:
   acks harmless.
 - **SIGTERM.** Stops consuming, drains for up to `BIZON_RS_DRAIN_SECS`, commits, and exits 0.
 - **Errors.** A pipeline error drains what is safe, commits it (never the failing message), and exits non-zero.
+- **Idle partitions.** A partition with no new messages keeps its old committed offset, and the broker expires
+  it once no group member subscribes to the topic (KIP-211); `auto.offset.reset: earliest` then re-reads the
+  topic. Every `BIZON_RS_RECOMMIT_SECS`, the worker commits the current offset of idle partitions again.
+- **Stalls.** `/healthz` fails once a consumed message has waited `BIZON_RS_STALL_SECS` for its ack, so a
+  liveness probe restarts a worker whose writes stopped making progress.
 - **Scale-down.** With static membership, a member that leaves does not send LeaveGroup, so its partitions wait
   for `session.timeout.ms` before reassignment. The same setting is what lets restarts rejoin without a rebalance.
 
@@ -97,4 +104,5 @@ These are reference numbers, not guarantees:
 - **Write throughput:** about 118 MiB/s sustained for 15 minutes on one AppendRows connection from GKE, with ack
   latency p50 146 ms and p99 250 ms.
 - **Memory:** tens of MiB resident for a low-volume CDC pipeline. The ceiling is set by `BIZON_RS_INFLIGHT_BYTES`
-  plus `BIZON_RS_QUEUE_KBYTES`.
+  plus `BIZON_RS_QUEUE_KBYTES`. The binary uses jemalloc: under glibc malloc, a 35-minute soak with bursty
+  15–30 KB JSON messages grew from 418 to 621 MiB; jemalloc stayed at 453–464 MiB.

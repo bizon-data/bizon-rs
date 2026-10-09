@@ -125,8 +125,7 @@ pub enum MessageEncoding {
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub name: String,
-    #[serde(rename = "stream")]
-    _stream: Option<String>,
+    pub stream: Option<String>,
     pub sync_mode: String,
     #[serde(default, rename = "force_ignore_checkpoint")]
     _force_ignore_checkpoint: Option<bool>,
@@ -420,7 +419,7 @@ fn scalar(s: &str) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn env(name: &str) -> Option<String> {
@@ -438,7 +437,7 @@ mod tests {
         )
     }
 
-    fn load(name: &str) -> Result<Config, ConfigError> {
+    pub(crate) fn load(name: &str) -> Result<Config, ConfigError> {
         let path = format!("{}/../../fixtures/configs/{name}.yml", env!("CARGO_MANIFEST_DIR"));
         Config::from_yaml(&std::fs::read_to_string(path).unwrap(), env)
     }

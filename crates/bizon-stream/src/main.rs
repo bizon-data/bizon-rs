@@ -80,6 +80,11 @@ struct SmokeArgs {
     quota_project: Option<String>,
 }
 
+// glibc malloc keeps freed payload memory in per-thread arenas, so RSS ratchets up on pods holding
+// many partitions of large messages; jemalloc returns it.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

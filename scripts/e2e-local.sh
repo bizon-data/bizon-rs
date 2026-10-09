@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check on a local Redpanda with the fake BigQuery write server: normal run, SIGTERM
-# drain, kill -9 and restart. Asserts every produced row was appended at least once and the
-# consumer group ends with zero lag. Requires docker; run from the repo root after
+# drain, kill -9 and restart, rebalance, and a writer that never acks. Asserts every produced row
+# was appended at least once, the consumer group ends with zero lag, and /healthz fails on the
+# stall. Requires docker; run from the repo root after
 # `cargo build --release -p bizon-stream -p fake-bqwrite`.
 set -euo pipefail
 
@@ -113,5 +114,22 @@ wait_distinct $EXPECTED 180
 for _ in $(seq 1 30); do [ "$(lag)" = "0" ] && break; sleep 1; done
 echo "   lag: $(lag)"; [ "$(lag)" = "0" ]
 grep -h "partitions assigned\|partitions revoked" "$WORK"/worker*.log | tail -4 | sed 's/^/   /'
+# librdkafka reports lag every 10 s, after the 5 s commit.
+for _ in $(seq 1 30); do curl -s localhost:18080/metrics | grep -q "^bizon_rs_consumer_lag{topic=\"$TOPIC\"} 0$" && break; sleep 1; done
+curl -s localhost:18080/metrics | grep -E "consumer_lag|partitions_(assigned|revoked) " | sed 's/^/   /'
+curl -s localhost:18080/metrics | grep -q "^bizon_rs_consumer_lag{topic=\"$TOPIC\"} 0$"
 kill -TERM $FIRST; wait $FIRST
-echo "PASS: $EXPECTED distinct rows across kill, restart and rebalances; group lag 0"
+
+echo "4. a writer that never acks fails /healthz"
+kill $FAKE_PID; wait $FAKE_PID 2>/dev/null || true
+$BIN/fake-bqwrite --addr 127.0.0.1:50061 --latency-ms 3600000 >"$WORK/fake-hang.log" 2>&1 &
+FAKE_PID=$!
+produce $EXPECTED 10
+BIZON_RS_STALL_SECS=10 start_worker
+curl -sf localhost:18080/healthz >/dev/null && echo "   healthy while acks are pending"
+for _ in $(seq 1 30); do curl -sf localhost:18080/healthz >/dev/null || break; sleep 1; done
+code=$(curl -s -o /dev/null -w '%{http_code}' localhost:18080/healthz)
+echo "   /healthz $code, oldest unacked $(curl -s localhost:18080/metrics | awk '/^bizon_rs_oldest_unacked_secs/ {print $2}') s"
+[ "$code" = "503" ]
+kill -9 $WORKER_PID; wait $WORKER_PID 2>/dev/null || true
+echo "PASS: $EXPECTED distinct rows across kill, restart and rebalances; group lag 0; stall detected"
