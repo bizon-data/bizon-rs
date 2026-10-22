@@ -106,3 +106,30 @@ These are reference numbers, not guarantees:
 - **Memory:** tens of MiB resident for a low-volume CDC pipeline. The ceiling is set by `BIZON_RS_INFLIGHT_BYTES`
   plus `BIZON_RS_QUEUE_KBYTES`. The binary uses jemalloc: under glibc malloc, a 35-minute soak with bursty
   15–30 KB JSON messages grew from 418 to 621 MiB; jemalloc stayed at 453–464 MiB.
+
+### In production
+
+One deployment moved 23 Kafka pipelines (all six built-in types, 13 Kafka clusters, 93 pods) from bizon's Python
+worker to bizon-rs, with the same configs and tables. The comparison below is one week under Python against the
+same weekdays two weeks later under bizon-rs, from Kubernetes metrics at 1-minute resolution.
+
+| | Python worker | bizon-rs | |
+|---|---|---|---|
+| CPU used, average | 38.5 cores | 2.5 cores | 15× less |
+| Memory used, average | 231 GB | 11 GB | 21× less |
+| CPU per GB of Kafka traffic | 0.40 core-h | 0.048 core-h | 8.2× less |
+| CPU per 1,000 rows written | 4.8 core-s | 0.47 core-s | 10× less |
+| Nodes (32 vCPU), average | 6.2 | 1.03 | |
+| Pods OOM-killed | 10 | 0 | |
+| Freshness p95, Debezium CDC tables | 2.7–3.4 min | 1.2 s | |
+
+- **The Python week carried 1.85× the traffic and was days behind on some topics**, so CPU per GB and per row
+  are the fair ratios. They agree with an earlier 8-hour matched comparison (8.5× and 8.4×).
+- **Fleet CPU per row is far above the offline figure** on both sides: it includes Kafka, TLS, the BigQuery
+  client and the baseline of many mostly idle pods.
+- **Duplicates:** on one CDC table, 0.0003% of rows in the week shared a Kafka offset with another row, against
+  0.5% under Python.
+- **A single preemptible node restarts everything.** The fleet fit on one node, which was replaced about 2.5
+  times a day. Every pod restarted each time, and lag returned to its baseline within 12 minutes in 28 of 32
+  replacements (at most 54). Those restarts set the worst-case freshness, about 4 minutes. If that matters,
+  spread the pods over more than one node.

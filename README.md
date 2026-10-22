@@ -7,7 +7,8 @@ BigQuery through the Storage Write API. It accepts the same YAML config as bizon
 
 On a production-like Debezium sample it needs about 6.6 µs of CPU per row, against roughly 35–40 µs for the
 Python worker, and its resident memory stays in the tens of MiB. One Storage Write connection sustained about
-118 MiB/s.
+118 MiB/s. In production, a 23-pipeline fleet used 8–10× less CPU per GB and per row after the switch (see
+"In production" in `docs/DESIGN.md`).
 
 ## How it works
 
